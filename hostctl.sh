@@ -6,7 +6,8 @@ set -Eeuo pipefail
 # hostctl - Main CLI Router
 # =========================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 COMMON_LIB="${SCRIPT_DIR}/lib/common.sh"
 INIT_LIB="${SCRIPT_DIR}/lib/init.sh"
