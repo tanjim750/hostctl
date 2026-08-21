@@ -16,6 +16,7 @@ DOCKER_LIB="${SCRIPT_DIR}/lib/docker.sh"
 NGINX_LIB="${SCRIPT_DIR}/lib/nginx.sh"
 SSL_LIB="${SCRIPT_DIR}/lib/ssl.sh"
 FIREWALL_LIB="${SCRIPT_DIR}/lib/firewall.sh"
+BACKUP_LIB="${SCRIPT_DIR}/lib/backup.sh"
 
 # ---------------------------------------------------------
 # Load required libraries
@@ -70,6 +71,13 @@ fi
 
 # shellcheck source=lib/firewall.sh
 source "$FIREWALL_LIB"
+
+if [[ ! -f "$BACKUP_LIB" ]]; then
+    die "Missing required library: $BACKUP_LIB"
+fi
+
+# shellcheck source=lib/backup.sh
+source "$BACKUP_LIB"
 
 # ---------------------------------------------------------
 # Help
@@ -411,12 +419,24 @@ case "$COMMAND" in
         ;;
 
     # Database / Backup
-    --db-backup|\
-    --db-restore|\
-    --backup-now|\
-    --backup-schedule|\
+    --db-backup)
+        cmd_db_backup "$@"
+        ;;
+
+    --db-restore)
+        cmd_db_restore "$@"
+        ;;
+
+    --backup-now)
+        cmd_backup_now "$@"
+        ;;
+
+    --backup-schedule)
+        cmd_backup_schedule "$@"
+        ;;
+
     --backup-status)
-        die "${COMMAND} is not implemented yet."
+        cmd_backup_status "$@"
         ;;
 
     # rclone
