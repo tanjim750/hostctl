@@ -12,6 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 COMMON_LIB="${SCRIPT_DIR}/lib/common.sh"
 INIT_LIB="${SCRIPT_DIR}/lib/init.sh"
 SYSTEM_LIB="${SCRIPT_DIR}/lib/system.sh"
+DOCKER_LIB="${SCRIPT_DIR}/lib/docker.sh"
 
 # ---------------------------------------------------------
 # Load required libraries
@@ -38,6 +39,13 @@ fi
 
 # shellcheck source=lib/system.sh
 source "$SYSTEM_LIB"
+
+if [[ ! -f "$DOCKER_LIB" ]]; then
+    die "Missing required library: $DOCKER_LIB"
+fi
+
+# shellcheck source=lib/docker.sh
+source "$DOCKER_LIB"
 
 # ---------------------------------------------------------
 # Help
@@ -212,19 +220,52 @@ case "$COMMAND" in
         ;;
 
     # Docker
-    --docker|\
-    --docker-status|\
-    --docker-build|\
-    --docker-start|\
-    --docker-stop|\
-    --docker-restart|\
-    --docker-rebuild|\
-    --docker-down|\
-    --docker-pull|\
-    --docker-logs|\
-    --docker-logs-clear|\
+    --docker)
+        cmd_docker "$@"
+        ;;
+
+    --docker-status)
+        cmd_docker_status "$@"
+        ;;
+
+    --docker-build)
+        cmd_docker_build "$@"
+        ;;
+
+    --docker-start)
+        cmd_docker_start "$@"
+        ;;
+
+    --docker-stop)
+        cmd_docker_stop "$@"
+        ;;
+
+    --docker-restart)
+        cmd_docker_restart "$@"
+        ;;
+
+    --docker-rebuild)
+        cmd_docker_rebuild "$@"
+        ;;
+
+    --docker-down)
+        cmd_docker_down "$@"
+        ;;
+
+    --docker-pull)
+        cmd_docker_pull "$@"
+        ;;
+
+    --docker-logs)
+        cmd_docker_logs "$@"
+        ;;
+
+    --docker-logs-clear)
+        cmd_docker_logs_clear "$@"
+        ;;
+
     --docker-ps)
-        die "${COMMAND} is not implemented yet."
+        cmd_docker_ps "$@"
         ;;
 
     # Nginx
