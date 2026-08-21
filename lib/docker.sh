@@ -228,6 +228,10 @@ cmd_docker_status() {
 # Compose helpers
 # ---------------------------------------------------------
 
+COMPOSE_FILE=""
+ENV_FILE=""
+DOCKER_PROJECT_DIR=""
+
 find_compose_files() {
     local project_dir
 
@@ -235,22 +239,73 @@ find_compose_files() {
     find "$project_dir" -maxdepth 1 -type f -name 'docker-compose*' | sort
 }
 
-get_compose_file() {
+absolute_file_path() {
+    local input_path="$1"
+    local base_dir="${2:-$(pwd)}"
+    local dir_name
+    local file_name
+
+    if [[ "$input_path" != /* ]]; then
+        input_path="${base_dir}/${input_path}"
+    fi
+
+    dir_name="$(dirname "$input_path")"
+    file_name="$(basename "$input_path")"
+
+    if [[ ! -d "$dir_name" ]]; then
+        return 1
+    fi
+
+    dir_name="$(cd "$dir_name" && pwd -P)" || return 1
+    printf '%s/%s\n' "$dir_name" "$file_name"
+}
+
+prompt_manual_compose_file() {
     local project_dir
+    local input_path
+    local resolved_path
+
+    project_dir="$(get_project_dir)"
+
+    echo "No docker-compose* file found in:" >&2
+    printf '%s\n' "$project_dir" >&2
+    echo >&2
+
+    while true; do
+        input_path="$(ask_input "Enter Docker Compose file path")"
+        if [[ -z "$input_path" ]]; then
+            error "Compose file path is required."
+            continue
+        fi
+
+        if ! resolved_path="$(absolute_file_path "$input_path" "$project_dir")"; then
+            error "Invalid path: ${input_path}"
+            continue
+        fi
+
+        if [[ ! -f "$resolved_path" ]]; then
+            error "Compose file does not exist or is not a regular file: ${resolved_path}"
+            continue
+        fi
+
+        printf '%s\n' "$resolved_path"
+        return 0
+    done
+}
+
+resolve_compose_file() {
     local files=()
     local file
     local choice
     local selected_index
-
-    project_dir="$(get_project_dir)"
 
     while IFS= read -r file; do
         files+=("$file")
     done < <(find_compose_files)
 
     if [[ "${#files[@]}" -eq 0 ]]; then
-        error "No docker-compose* file found in ${project_dir}"
-        return 1
+        prompt_manual_compose_file
+        return
     fi
 
     if [[ "${#files[@]}" -eq 1 ]]; then
@@ -280,21 +335,133 @@ get_compose_file() {
     done
 }
 
-compose_cmd() {
-    local compose_file="$1"
-    shift
+find_env_files() {
+    local project_dir="$1"
+    local names=(
+        ".env"
+        ".env.prod"
+        ".env.production"
+        ".env.dev"
+        ".env.development"
+    )
+    local name
 
-    docker compose -f "$compose_file" "$@"
+    for name in "${names[@]}"; do
+        if [[ -f "${project_dir}/${name}" ]]; then
+            printf '%s\n' "${project_dir}/${name}"
+        fi
+    done
+}
+
+prompt_manual_env_file() {
+    local base_dir="$1"
+    local input_path
+    local resolved_path
+
+    while true; do
+        input_path="$(ask_input "Enter environment file path")"
+        if [[ -z "$input_path" ]]; then
+            error "Environment file path is required."
+            continue
+        fi
+
+        if ! resolved_path="$(absolute_file_path "$input_path" "$base_dir")"; then
+            error "Invalid path: ${input_path}"
+            continue
+        fi
+
+        if [[ ! -f "$resolved_path" ]]; then
+            error "Environment file does not exist: ${resolved_path}"
+            continue
+        fi
+
+        printf '%s\n' "$resolved_path"
+        return 0
+    done
+}
+
+resolve_env_file() {
+    local project_dir="$1"
+    local env_files=()
+    local env_file
+    local choice
+    local selected_index
+
+    while IFS= read -r env_file; do
+        env_files+=("$env_file")
+    done < <(find_env_files "$project_dir")
+
+    if [[ "${#env_files[@]}" -eq 0 ]]; then
+        echo "No environment file detected." >&2
+        echo >&2
+        choice="$(
+            select_option \
+                "Environment:" \
+                "Continue without env file" \
+                "Enter env file path"
+        )"
+
+        if [[ "$choice" == "Enter env file path" ]]; then
+            prompt_manual_env_file "$project_dir"
+        else
+            printf '\n'
+        fi
+        return 0
+    fi
+
+    if [[ "${#env_files[@]}" -eq 1 ]]; then
+        echo "Environment file detected:" >&2
+        printf '%s\n' "${env_files[0]}" >&2
+        echo >&2
+
+        if confirm "Use this file?" "yes"; then
+            printf '%s\n' "${env_files[0]}"
+        else
+            printf '\n'
+        fi
+        return 0
+    fi
+
+    echo "Environment files found:" >&2
+    echo >&2
+    echo "0. Continue without env file" >&2
+
+    local i
+    for i in "${!env_files[@]}"; do
+        printf '%d. %s\n' "$((i + 1))" "${env_files[$i]}" >&2
+    done
+
+    while true; do
+        read -r -p "Select [0-${#env_files[@]}]: " choice
+        if [[ "$choice" == "0" ]]; then
+            printf '\n'
+            return 0
+        fi
+
+        if [[ "$choice" =~ ^[0-9]+$ ]] &&
+           (( choice >= 1 && choice <= ${#env_files[@]} )); then
+            selected_index=$((choice - 1))
+            printf '%s\n' "${env_files[$selected_index]}"
+            return 0
+        fi
+
+        warning "Invalid selection."
+    done
+}
+
+compose_exec() {
+    if [[ -n "${ENV_FILE:-}" ]]; then
+        docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+    else
+        docker compose -f "$COMPOSE_FILE" "$@"
+    fi
 }
 
 get_compose_services() {
-    local compose_file="$1"
-
-    compose_cmd "$compose_file" config --services
+    compose_exec config --services
 }
 
 select_compose_service() {
-    local compose_file="$1"
     local services=()
     local service
     local choice
@@ -302,10 +469,10 @@ select_compose_service() {
 
     while IFS= read -r service; do
         [[ -n "$service" ]] && services+=("$service")
-    done < <(get_compose_services "$compose_file")
+    done < <(get_compose_services)
 
     if [[ "${#services[@]}" -eq 0 ]]; then
-        die "No services found in $(basename "$compose_file")."
+        die "No services found in $(basename "$COMPOSE_FILE")."
     fi
 
     echo "Services:" >&2
@@ -330,41 +497,72 @@ select_compose_service() {
 }
 
 get_compose_container_ids() {
-    local compose_file="$1"
-    local service="${2:-}"
+    local service="${1:-}"
 
     if [[ -n "$service" ]]; then
-        compose_cmd "$compose_file" ps -q "$service"
+        compose_exec ps -q "$service"
     else
-        compose_cmd "$compose_file" ps -q
+        compose_exec ps -q
     fi
 }
 
 show_docker_project_context() {
-    local compose_file="$1"
-
     echo
-    printf 'Project: %s\n' "$(get_project_dir)"
-    printf 'Compose: %s\n' "$(basename "$compose_file")"
+    printf 'Project: %s\n' "$DOCKER_PROJECT_DIR"
+    printf 'Compose: %s\n' "$COMPOSE_FILE"
+    if [[ -n "${ENV_FILE:-}" ]]; then
+        printf 'Environment: %s\n' "$ENV_FILE"
+    else
+        printf 'Environment: none\n'
+    fi
     echo
 }
 
 prepare_docker_project_command() {
-    local compose_file
+    local resolved_compose
+    local resolved_env
 
     ensure_docker_project_ready
-    compose_file="$(get_compose_file)" || return 1
-    show_docker_project_context "$compose_file" >&2
-    printf '%s\n' "$compose_file"
+
+    while true; do
+        if ! resolved_compose="$(resolve_compose_file)"; then
+            return 1
+        fi
+
+        COMPOSE_FILE="$resolved_compose"
+        DOCKER_PROJECT_DIR="$(cd "$(dirname "$COMPOSE_FILE")" && pwd -P)" || return 1
+
+        if ! resolved_env="$(resolve_env_file "$DOCKER_PROJECT_DIR")"; then
+            return 1
+        fi
+
+        ENV_FILE="$resolved_env"
+
+        if compose_exec config >/dev/null; then
+            break
+        fi
+
+        error "Docker Compose config validation failed for: ${COMPOSE_FILE}"
+        if [[ -n "${ENV_FILE:-}" ]]; then
+            error "Environment file: ${ENV_FILE}"
+        else
+            error "Environment file: none"
+        fi
+
+        if ! confirm "Select compose/environment files again?" "yes"; then
+            return 1
+        fi
+    done
+
+    show_docker_project_context >&2
 }
 
 log_docker_result() {
     local operation="$1"
     local result="$2"
-    local compose_file="$3"
-    local details="${4:-}"
+    local details="${3:-}"
 
-    log_event "${operation} result=${result} cwd=$(get_project_dir) compose=$(basename "$compose_file") ${details}"
+    log_event "${operation} result=${result} cwd=$(get_project_dir) project=${DOCKER_PROJECT_DIR} compose=${COMPOSE_FILE} env=${ENV_FILE:-none} ${details}"
 }
 
 # ---------------------------------------------------------
@@ -372,13 +570,14 @@ log_docker_result() {
 # ---------------------------------------------------------
 
 cmd_docker_build() {
-    local compose_file
     local mode
     local service=""
     local args=(build)
     local exit_code=0
 
-    compose_file="$(prepare_docker_project_command)"
+    if ! prepare_docker_project_command; then
+        return 1
+    fi
 
     mode="$(
         select_option \
@@ -396,11 +595,11 @@ cmd_docker_build() {
             args+=(--no-cache)
             ;;
         "Build a specific service")
-            service="$(select_compose_service "$compose_file")"
+            service="$(select_compose_service)"
             args+=("$service")
             ;;
         "Build a specific service without cache")
-            service="$(select_compose_service "$compose_file")"
+            service="$(select_compose_service)"
             args+=(--no-cache "$service")
             ;;
     esac
@@ -410,94 +609,98 @@ cmd_docker_build() {
         return 0
     fi
 
-    log_event "DOCKER_BUILD start cwd=$(get_project_dir) compose=$(basename "$compose_file") mode=${mode} service=${service:-all}"
-    compose_cmd "$compose_file" "${args[@]}" || exit_code=$?
-    log_docker_result "DOCKER_BUILD" "$([[ "$exit_code" -eq 0 ]] && printf success || printf failed)" "$compose_file" "mode=${mode} service=${service:-all}"
+    log_event "DOCKER_BUILD start cwd=$(get_project_dir) project=${DOCKER_PROJECT_DIR} compose=${COMPOSE_FILE} env=${ENV_FILE:-none} mode=${mode} service=${service:-all}"
+    compose_exec "${args[@]}" || exit_code=$?
+    log_docker_result "DOCKER_BUILD" "$([[ "$exit_code" -eq 0 ]] && printf success || printf failed)" "mode=${mode} service=${service:-all}"
     return "$exit_code"
 }
 
 cmd_docker_start() {
-    local compose_file
     local mode
     local service=""
     local exit_code=0
 
-    compose_file="$(prepare_docker_project_command)"
+    if ! prepare_docker_project_command; then
+        return 1
+    fi
 
     mode="$(select_option "Start:" "Full compose stack" "Specific service")"
 
     if [[ "$mode" == "Specific service" ]]; then
-        service="$(select_compose_service "$compose_file")"
+        service="$(select_compose_service)"
     fi
 
     if [[ -n "$service" ]]; then
-        compose_cmd "$compose_file" up -d "$service" || exit_code=$?
+        compose_exec up -d "$service" || exit_code=$?
     else
-        compose_cmd "$compose_file" up -d || exit_code=$?
+        compose_exec up -d || exit_code=$?
     fi
 
-    compose_cmd "$compose_file" ps || true
-    log_docker_result "DOCKER_START" "$([[ "$exit_code" -eq 0 ]] && printf success || printf failed)" "$compose_file" "service=${service:-all}"
+    compose_exec ps || true
+    log_docker_result "DOCKER_START" "$([[ "$exit_code" -eq 0 ]] && printf success || printf failed)" "service=${service:-all}"
     return "$exit_code"
 }
 
 cmd_docker_stop() {
-    local compose_file
     local mode
     local service=""
     local exit_code=0
 
-    compose_file="$(prepare_docker_project_command)"
+    if ! prepare_docker_project_command; then
+        return 1
+    fi
 
     mode="$(select_option "Stop:" "Full compose stack" "Specific service")"
 
     if [[ "$mode" == "Specific service" ]]; then
-        service="$(select_compose_service "$compose_file")"
+        service="$(select_compose_service)"
     fi
 
     if [[ -n "$service" ]]; then
-        compose_cmd "$compose_file" stop "$service" || exit_code=$?
+        compose_exec stop "$service" || exit_code=$?
     else
-        compose_cmd "$compose_file" stop || exit_code=$?
+        compose_exec stop || exit_code=$?
     fi
 
-    log_docker_result "DOCKER_STOP" "$([[ "$exit_code" -eq 0 ]] && printf success || printf failed)" "$compose_file" "service=${service:-all}"
+    log_docker_result "DOCKER_STOP" "$([[ "$exit_code" -eq 0 ]] && printf success || printf failed)" "service=${service:-all}"
     return "$exit_code"
 }
 
 cmd_docker_restart() {
-    local compose_file
     local mode
     local service=""
     local exit_code=0
 
-    compose_file="$(prepare_docker_project_command)"
+    if ! prepare_docker_project_command; then
+        return 1
+    fi
 
     mode="$(select_option "Restart:" "Full compose stack" "Specific service")"
 
     if [[ "$mode" == "Specific service" ]]; then
-        service="$(select_compose_service "$compose_file")"
+        service="$(select_compose_service)"
     fi
 
     if [[ -n "$service" ]]; then
-        compose_cmd "$compose_file" restart "$service" || exit_code=$?
+        compose_exec restart "$service" || exit_code=$?
     else
-        compose_cmd "$compose_file" restart || exit_code=$?
+        compose_exec restart || exit_code=$?
     fi
 
-    compose_cmd "$compose_file" ps || true
-    log_docker_result "DOCKER_RESTART" "$([[ "$exit_code" -eq 0 ]] && printf success || printf failed)" "$compose_file" "service=${service:-all}"
+    compose_exec ps || true
+    log_docker_result "DOCKER_RESTART" "$([[ "$exit_code" -eq 0 ]] && printf success || printf failed)" "service=${service:-all}"
     return "$exit_code"
 }
 
 cmd_docker_rebuild() {
-    local compose_file
     local strategy
     local service=""
     local no_cache_choice
     local exit_code=0
 
-    compose_file="$(prepare_docker_project_command)"
+    if ! prepare_docker_project_command; then
+        return 1
+    fi
 
     strategy="$(
         select_option \
@@ -510,12 +713,12 @@ cmd_docker_rebuild() {
 
     case "$strategy" in
         "Build then recreate")
-            compose_cmd "$compose_file" build || exit_code=$?
-            [[ "$exit_code" -eq 0 ]] && compose_cmd "$compose_file" up -d --force-recreate || exit_code=$?
+            compose_exec build || exit_code=$?
+            [[ "$exit_code" -eq 0 ]] && compose_exec up -d --force-recreate || exit_code=$?
             ;;
         "Build without cache then recreate")
-            compose_cmd "$compose_file" build --no-cache || exit_code=$?
-            [[ "$exit_code" -eq 0 ]] && compose_cmd "$compose_file" up -d --force-recreate || exit_code=$?
+            compose_exec build --no-cache || exit_code=$?
+            [[ "$exit_code" -eq 0 ]] && compose_exec up -d --force-recreate || exit_code=$?
             ;;
         "Bring stack down, build, then start")
             warning "Temporary downtime will occur."
@@ -523,33 +726,34 @@ cmd_docker_rebuild() {
                 warning "Docker rebuild cancelled."
                 return 0
             fi
-            compose_cmd "$compose_file" down || exit_code=$?
-            [[ "$exit_code" -eq 0 ]] && compose_cmd "$compose_file" build || exit_code=$?
-            [[ "$exit_code" -eq 0 ]] && compose_cmd "$compose_file" up -d || exit_code=$?
+            compose_exec down || exit_code=$?
+            [[ "$exit_code" -eq 0 ]] && compose_exec build || exit_code=$?
+            [[ "$exit_code" -eq 0 ]] && compose_exec up -d || exit_code=$?
             ;;
         "Specific service rebuild")
-            service="$(select_compose_service "$compose_file")"
+            service="$(select_compose_service)"
             no_cache_choice="$(select_option "Service build mode:" "Normal build" "Build without cache")"
             if [[ "$no_cache_choice" == "Build without cache" ]]; then
-                compose_cmd "$compose_file" build --no-cache "$service" || exit_code=$?
+                compose_exec build --no-cache "$service" || exit_code=$?
             else
-                compose_cmd "$compose_file" build "$service" || exit_code=$?
+                compose_exec build "$service" || exit_code=$?
             fi
-            [[ "$exit_code" -eq 0 ]] && compose_cmd "$compose_file" up -d --force-recreate "$service" || exit_code=$?
+            [[ "$exit_code" -eq 0 ]] && compose_exec up -d --force-recreate "$service" || exit_code=$?
             ;;
     esac
 
-    compose_cmd "$compose_file" ps || true
-    log_docker_result "DOCKER_REBUILD" "$([[ "$exit_code" -eq 0 ]] && printf success || printf failed)" "$compose_file" "strategy=${strategy} service=${service:-all}"
+    compose_exec ps || true
+    log_docker_result "DOCKER_REBUILD" "$([[ "$exit_code" -eq 0 ]] && printf success || printf failed)" "strategy=${strategy} service=${service:-all}"
     return "$exit_code"
 }
 
 cmd_docker_down() {
-    local compose_file
     local args=(down)
     local exit_code=0
 
-    compose_file="$(prepare_docker_project_command)"
+    if ! prepare_docker_project_command; then
+        return 1
+    fi
 
     if confirm "Also remove compose volumes?" "no"; then
         echo
@@ -569,45 +773,47 @@ cmd_docker_down() {
         return 0
     fi
 
-    compose_cmd "$compose_file" "${args[@]}" || exit_code=$?
-    log_docker_result "DOCKER_DOWN" "$([[ "$exit_code" -eq 0 ]] && printf success || printf failed)" "$compose_file" "volumes=$([[ " ${args[*]} " == *" --volumes "* ]] && printf yes || printf no)"
+    compose_exec "${args[@]}" || exit_code=$?
+    log_docker_result "DOCKER_DOWN" "$([[ "$exit_code" -eq 0 ]] && printf success || printf failed)" "volumes=$([[ " ${args[*]} " == *" --volumes "* ]] && printf yes || printf no)"
     return "$exit_code"
 }
 
 cmd_docker_pull() {
-    local compose_file
     local mode
     local service=""
     local exit_code=0
 
-    compose_file="$(prepare_docker_project_command)"
+    if ! prepare_docker_project_command; then
+        return 1
+    fi
 
     mode="$(select_option "Pull:" "All services" "Specific service")"
 
     if [[ "$mode" == "Specific service" ]]; then
-        service="$(select_compose_service "$compose_file")"
-        compose_cmd "$compose_file" pull "$service" || exit_code=$?
+        service="$(select_compose_service)"
+        compose_exec pull "$service" || exit_code=$?
     else
-        compose_cmd "$compose_file" pull || exit_code=$?
+        compose_exec pull || exit_code=$?
     fi
 
-    log_docker_result "DOCKER_PULL" "$([[ "$exit_code" -eq 0 ]] && printf success || printf failed)" "$compose_file" "service=${service:-all}"
+    log_docker_result "DOCKER_PULL" "$([[ "$exit_code" -eq 0 ]] && printf success || printf failed)" "service=${service:-all}"
     return "$exit_code"
 }
 
 cmd_docker_logs() {
-    local compose_file
     local mode
     local service=""
     local follow_args=()
     local exit_code=0
 
-    compose_file="$(prepare_docker_project_command)"
+    if ! prepare_docker_project_command; then
+        return 1
+    fi
 
     mode="$(select_option "Logs:" "All services" "Specific service")"
 
     if [[ "$mode" == "Specific service" ]]; then
-        service="$(select_compose_service "$compose_file")"
+        service="$(select_compose_service)"
     fi
 
     if confirm "Follow logs continuously?" "yes"; then
@@ -618,9 +824,9 @@ cmd_docker_logs() {
 
     set +e
     if [[ -n "$service" ]]; then
-        compose_cmd "$compose_file" logs "${follow_args[@]}" "$service"
+        compose_exec logs "${follow_args[@]}" "$service"
     else
-        compose_cmd "$compose_file" logs "${follow_args[@]}"
+        compose_exec logs "${follow_args[@]}"
     fi
     exit_code=$?
     set -e
@@ -633,12 +839,12 @@ cmd_docker_logs() {
 }
 
 cmd_docker_ps() {
-    local compose_file
+    if ! prepare_docker_project_command; then
+        return 1
+    fi
 
-    compose_file="$(prepare_docker_project_command)"
-
-    if ! compose_cmd "$compose_file" ps -a; then
-        compose_cmd "$compose_file" ps
+    if ! compose_exec ps -a; then
+        compose_exec ps
     fi
 }
 
@@ -726,18 +932,17 @@ clear_container_log() {
 }
 
 select_compose_container() {
-    local compose_file="$1"
     local service
     local containers=()
     local container
     local choice
     local selected_index
 
-    service="$(select_compose_service "$compose_file")"
+    service="$(select_compose_service)"
 
     while IFS= read -r container; do
         [[ -n "$container" ]] && containers+=("$container")
-    done < <(get_compose_container_ids "$compose_file" "$service")
+    done < <(get_compose_container_ids "$service")
 
     if [[ "${#containers[@]}" -eq 0 ]]; then
         die "No running containers found for service: ${service}"
@@ -770,29 +975,30 @@ select_compose_container() {
 }
 
 cmd_docker_logs_clear() {
-    local compose_file
     local mode
     local container
     local containers=()
     local exit_code=0
 
-    compose_file="$(prepare_docker_project_command)"
+    if ! prepare_docker_project_command; then
+        return 1
+    fi
 
     mode="$(select_option "Clear Docker logs:" "Specific service/container" "All containers in this compose stack")"
 
     if [[ "$mode" == "Specific service/container" ]]; then
-        container="$(select_compose_container "$compose_file")"
+        container="$(select_compose_container)"
         if ! confirm "Clear logs for selected container?" "no"; then
             warning "Docker log clear cancelled."
             return 0
         fi
 
-        log_event "DOCKER_LOG_CLEAR start cwd=$(get_project_dir) compose=$(basename "$compose_file") container=${container}"
+        log_event "DOCKER_LOG_CLEAR start cwd=$(get_project_dir) project=${DOCKER_PROJECT_DIR} compose=${COMPOSE_FILE} env=${ENV_FILE:-none} container=${container}"
         clear_container_log "$container" || exit_code=$?
     else
         while IFS= read -r container; do
             [[ -n "$container" ]] && containers+=("$container")
-        done < <(get_compose_container_ids "$compose_file")
+        done < <(get_compose_container_ids)
 
         if [[ "${#containers[@]}" -eq 0 ]]; then
             warning "No running containers found for this compose stack."
@@ -805,13 +1011,13 @@ cmd_docker_logs_clear() {
             return 0
         fi
 
-        log_event "DOCKER_LOG_CLEAR start cwd=$(get_project_dir) compose=$(basename "$compose_file") containers=${#containers[@]}"
+        log_event "DOCKER_LOG_CLEAR start cwd=$(get_project_dir) project=${DOCKER_PROJECT_DIR} compose=${COMPOSE_FILE} env=${ENV_FILE:-none} containers=${#containers[@]}"
 
         for container in "${containers[@]}"; do
             clear_container_log "$container" || exit_code=$?
         done
     fi
 
-    log_docker_result "DOCKER_LOG_CLEAR" "$([[ "$exit_code" -eq 0 ]] && printf success || printf failed)" "$compose_file"
+    log_docker_result "DOCKER_LOG_CLEAR" "$([[ "$exit_code" -eq 0 ]] && printf success || printf failed)"
     return "$exit_code"
 }
