@@ -156,12 +156,22 @@ EOF
 # Error handling
 # ---------------------------------------------------------
 
+HOSTCTL_ERROR_HANDLED=0
+
 on_error() {
     local exit_code=$?
+
+    if [[ "${HOSTCTL_ERROR_HANDLED:-0}" -eq 1 ]]; then
+        return "$exit_code"
+    fi
+
+    HOSTCTL_ERROR_HANDLED=1
+
     local line_no="${BASH_LINENO[0]:-unknown}"
     local failed_command="${1:-unknown}"
 
-    error "Command failed at line ${line_no} with exit code ${exit_code}."
+    error "Command failed: ${failed_command}"
+    error "Location: line ${line_no}, exit code ${exit_code}"
     log_event "ERROR exit=${exit_code} line=${line_no} command=${failed_command}"
 
     exit "$exit_code"

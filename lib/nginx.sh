@@ -32,6 +32,12 @@ nginx_template_dir() {
     printf '%s/templates/nginx\n' "$SCRIPT_DIR"
 }
 
+nginx_debug() {
+    if [[ "${HOSTCTL_DEBUG:-0}" == "1" ]]; then
+        printf '[DEBUG] %s\n' "$*" >&2
+    fi
+}
+
 ensure_nginx_layout() {
     [[ -f "$NGINX_CONF" ]] || die "Missing Nginx config: $NGINX_CONF"
     [[ -d "$NGINX_CONF_D" ]] || die "Missing Nginx conf.d directory: $NGINX_CONF_D"
@@ -65,7 +71,9 @@ validate_nginx_config() {
     local output
     local status=0
 
+    nginx_debug "command: nginx -t"
     output="$(nginx -t 2>&1)" || status=$?
+    nginx_debug "return code: ${status}"
     NGINX_LAST_TEST_OUTPUT="$output"
     printf '%s\n' "$output" >&2
 
@@ -85,6 +93,7 @@ validate_nginx_config() {
 }
 
 reload_nginx() {
+    nginx_debug "command: systemctl reload nginx"
     systemctl reload nginx
 }
 
@@ -1178,6 +1187,15 @@ delete_domain_config() {
 
 disable_domain() {
     local domain="$1"
+
+    if ! disable_domain_active_configs "$domain"; then
+        HOSTCTL_ERROR_HANDLED=1
+        return 1
+    fi
+}
+
+disable_domain_active_configs() {
+    local domain="$1"
     local records
     local record
     local active_path
@@ -1189,24 +1207,35 @@ disable_domain() {
     local moved_files=()
     local backup_pairs=()
     local disabled_path
+    local http_active="no"
+    local https_active="no"
+    local effective_status
 
     records="$(active_domain_config_records "$domain")"
 
     if [[ -z "$records" ]]; then
-        warning "Domain is already disabled: ${domain}"
-        return 0
+        error "No active config matching server_name ${domain} was found."
+        return 1
     fi
 
     echo
-    printf 'Domain %s is active in:\n' "$domain"
+    printf 'Disabling domain: %s\n' "$domain"
     echo
+    echo "Active configs:"
+
     while IFS= read -r record; do
         index=$((index + 1))
         active_path="$(cut -d'|' -f1 <<< "$record")"
         listeners="$(cut -d'|' -f3 <<< "$record")"
+        grep -Eq '(^|, )[[]?::[]]?:?80([ ,]|$)|(^|, )80([ ,]|$)' <<< "$listeners" && http_active="yes"
+        grep -Eq '443|ssl' <<< "$listeners" && https_active="yes"
         printf '%d. %s\n' "$index" "$active_path"
-        printf '   listeners: %s\n\n' "$listeners"
+        printf '   listeners: %s\n' "$listeners"
     done <<< "$records"
+    echo
+    printf 'HTTP active: %s\n' "$http_active"
+    printf 'HTTPS active: %s\n' "$https_active"
+    echo
 
     while IFS= read -r record; do
         active_path="$(cut -d'|' -f1 <<< "$record")"
@@ -1214,8 +1243,16 @@ disable_domain() {
         other_domains="$(cut -d'|' -f4 <<< "$record")"
 
         if [[ -n "$other_domains" ]]; then
-            error "Cannot safely disable ${domain}; shared config also declares: ${other_domains}"
-            error "Edit the shared server block safely before using hostctl disable."
+            error "Cannot disable shared config:"
+            error "        ${active_path}"
+            error ""
+            error "The file also serves:"
+            local other_domain
+            local other_domain_array
+            IFS=',' read -r -a other_domain_array <<< "$other_domains"
+            for other_domain in "${other_domain_array[@]}"; do
+                error "- ${other_domain}"
+            done
             return 1
         fi
 
@@ -1234,37 +1271,93 @@ disable_domain() {
     while IFS= read -r record; do
         active_path="$(cut -d'|' -f1 <<< "$record")"
         real_path="$(cut -d'|' -f2 <<< "$record")"
+        nginx_debug "disable_domain active_path=${active_path} real_path=${real_path}"
 
-        if [[ "$active_path" == "$NGINX_SITES_ENABLED/"* ]]; then
+        if [[ -L "$active_path" ]]; then
+            info "Removing enabled symlink: ${active_path}"
             removed_links+=("${active_path}|$(readlink "$active_path" 2>/dev/null || printf '%s' "$real_path")")
-            rm -f "$active_path"
-        elif [[ "$active_path" == "$NGINX_CONF_D/"*.conf ]]; then
+            if ! rm -f "$active_path"; then
+                error "Failed to remove symlink: ${active_path}"
+                rollback_domain_disable_state
+                return 1
+            fi
+        elif [[ -f "$active_path" && "$active_path" == "$NGINX_CONF_D/"*.conf ]]; then
             disabled_path="${active_path}.disabled"
+            info "Disabling config file: ${active_path} -> ${disabled_path}"
             backup_pairs+=("${active_path}|$(backup_file "$active_path" || true)")
             moved_files+=("${disabled_path}|${active_path}")
-            mv "$active_path" "$disabled_path"
+            if ! mv "$active_path" "$disabled_path"; then
+                error "Failed to disable config file: ${active_path}"
+                rollback_domain_disable_state
+                return 1
+            fi
+        elif [[ -f "$active_path" ]]; then
+            error "Refusing to delete regular enabled config file: ${active_path}"
+            rollback_domain_disable_state
+            return 1
+        else
+            error "Active config path is neither symlink nor regular file: ${active_path}"
+            rollback_domain_disable_state
+            return 1
         fi
     done <<< "$records"
 
-    if nginx_test_and_reload "$domain" && ! active_domain_config_records "$domain" | grep -q .; then
-        log_event "NGINX_DOMAIN_DISABLE domain=${domain} result=success"
-        success "Domain disabled on HTTP and HTTPS: ${domain}"
-        return 0
+    if ! nginx_test_and_reload "$domain"; then
+        warning "Disable failed validation; rolling back."
+        rollback_domain_disable_state
+        validate_nginx_config || true
+        log_event "NGINX_DOMAIN_DISABLE domain=${domain} result=failed"
+        return 1
     fi
 
-    warning "Disable failed or domain is still active; rolling back."
+    if active_domain_config_records "$domain" | grep -q .; then
+        error "Domain still appears in active Nginx configuration after disable."
+        rollback_domain_disable_state
+        validate_nginx_config || true
+        log_event "NGINX_DOMAIN_DISABLE domain=${domain} result=failed"
+        return 1
+    fi
+
+    if nginx_effective_config_has_domain "$domain"; then
+        error "Domain still appears in active Nginx configuration after disable."
+        rollback_domain_disable_state
+        validate_nginx_config || true
+        log_event "NGINX_DOMAIN_DISABLE domain=${domain} result=failed"
+        return 1
+    else
+        effective_status=$?
+        if [[ "$effective_status" -ne 1 ]]; then
+            error "Unable to inspect active Nginx configuration after disable."
+            rollback_domain_disable_state
+            validate_nginx_config || true
+            log_event "NGINX_DOMAIN_DISABLE domain=${domain} result=failed"
+            return 1
+        fi
+    fi
+
+    log_event "NGINX_DOMAIN_DISABLE domain=${domain} result=success"
+    success "Domain disabled: ${domain}"
+    return 0
+}
+
+rollback_domain_disable_state() {
     local pair
     local original
     local link_target
+
+    warning "Rolling back domain disable changes."
+
     for pair in "${removed_links[@]}"; do
         original="${pair%%|*}"
         link_target="${pair#*|}"
+        info "Restoring symlink: ${original} -> ${link_target}"
         ln -sfn "$link_target" "$original"
     done
 
     for pair in "${moved_files[@]}"; do
         disabled_path="${pair%%|*}"
         original="${pair#*|}"
+        info "Restoring config file: ${disabled_path} -> ${original}"
         [[ -e "$disabled_path" ]] && mv "$disabled_path" "$original"
     done
 
@@ -1273,10 +1366,36 @@ disable_domain() {
         link_target="${pair#*|}"
         [[ -n "$link_target" && -f "$link_target" ]] && rollback_file "$link_target" "$original" || true
     done
+}
 
-    validate_nginx_config || true
-    log_event "NGINX_DOMAIN_DISABLE domain=${domain} result=failed"
-    return 1
+nginx_effective_config_has_domain() {
+    local domain="$1"
+    local output
+    local status=0
+
+    nginx_debug "command: nginx -T"
+    output="$(nginx -T 2>/dev/null)" || status=$?
+    nginx_debug "return code: ${status}"
+    if (( status != 0 )); then
+        return 2
+    fi
+
+    awk -v domain="$domain" '
+        /^[[:space:]]*#/ { next }
+        /server_name[[:space:]]/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "server_name") {
+                    for (j = i + 1; j <= NF; j++) {
+                        name = $j;
+                        gsub(/;/, "", name);
+                        if (name == domain) found = 1;
+                        if ($j ~ /;/) break;
+                    }
+                }
+            }
+        }
+        END { exit found ? 0 : 1 }
+    ' <<< "$output"
 }
 
 configure_reverse_proxy() {
