@@ -650,8 +650,8 @@ config_certificates_for_domain() {
         certs="$(awk '/ssl_certificate[[:space:]]/ && $1 == "ssl_certificate" { gsub(/;/, "", $2); print $2 }' "$file" | sort -u | paste -sd ', ' -)"
     fi
 
-    if [[ -z "$certs" && -d "/etc/letsencrypt/live/${domain}" ]]; then
-        certs="/etc/letsencrypt/live/${domain}"
+    if [[ -z "$certs" && -d "$(ssl_certificate_dir "$domain")" ]]; then
+        certs="$(ssl_certificate_dir "$domain")"
     fi
 
     [[ -n "$certs" ]] && printf '%s\n' "$certs" || printf 'not detected\n'
@@ -706,6 +706,14 @@ domain_has_http_active() {
 
 domain_has_https_active() {
     active_domain_config_records "$1" | awk -F'|' '$3 ~ /443|ssl/ { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+domain_http_active() {
+    domain_has_http_active "$1"
+}
+
+domain_https_active() {
+    domain_has_https_active "$1"
 }
 
 domain_is_active() {
@@ -1140,6 +1148,7 @@ deploy_domain_config() {
     if nginx_test_and_reload "$domain"; then
         log_event "NGINX_DOMAIN_CREATE domain=${domain} result=success"
         success "Domain configured: ${domain}"
+        maybe_offer_ssl_activation "$domain"
         return 0
     fi
 
@@ -1184,6 +1193,14 @@ inspect_domain_config() {
     printf 'Status: %s\n' "$status"
     printf 'HTTP: %s\n' "$(domain_has_http_active "$domain" && printf 'active' || printf 'inactive')"
     printf 'HTTPS: %s\n' "$(domain_has_https_active "$domain" && printf 'active' || printf 'inactive')"
+    echo
+    printf 'SSL Certificate: %s\n' "$(ssl_certificate_status_label "$domain")"
+    if ssl_certificate_exists "$domain"; then
+        printf 'Certificate Path:\n%s\n' "$(ssl_certificate_fullchain "$domain")"
+    fi
+    if domain_has_http_active "$domain" && ! domain_has_https_active "$domain"; then
+        printf 'SSL Action: available\n'
+    fi
 
     if [[ -n "$records" ]]; then
         echo
@@ -1347,6 +1364,7 @@ restore_domain_previous_state() {
 
     log_event "NGINX_DOMAIN_ENABLE domain=${domain} mode=restore result=success state=${state_file}"
     success "Domain enabled: ${domain}"
+    maybe_offer_ssl_activation "$domain"
     return 0
 }
 
@@ -1416,6 +1434,7 @@ enable_domain() {
     if nginx_test_and_reload "$domain"; then
         log_event "NGINX_DOMAIN_ENABLE domain=${domain} result=success source=${source}"
         success "Domain enabled: ${domain}"
+        maybe_offer_ssl_activation "$domain"
         return 0
     fi
 
@@ -1700,9 +1719,13 @@ cmd_domain() {
     local domain
     local action
     local status
+    local http_active="no"
+    local https_active="no"
 
     domain="$(select_nginx_domain "yes")"
     status="$(domain_status_label "$domain")"
+    domain_has_http_active "$domain" && http_active="yes"
+    domain_has_https_active "$domain" && https_active="yes"
 
     if domain_config_exists "$domain" || domain_is_active "$domain"; then
         echo
@@ -1710,18 +1733,40 @@ cmd_domain() {
         echo
 
         if domain_is_active "$domain"; then
-            action="$(
-                select_option \
-                    "Domain action:" \
-                    "Inspect configuration" \
-                    "Update reverse proxy" \
-                    "Disable domain" \
-                    "Cancel"
-            )"
+            if [[ "$http_active" == "yes" && "$https_active" == "no" ]]; then
+                action="$(
+                    select_option \
+                        "Domain action:" \
+                        "Inspect configuration" \
+                        "Update reverse proxy" \
+                        "Enable SSL / HTTPS" \
+                        "Disable domain" \
+                        "Cancel"
+                )"
+            else
+                if [[ "$https_active" == "yes" ]]; then
+                    printf 'SSL: Active\n'
+                    echo
+                fi
+                action="$(
+                    select_option \
+                        "Domain action:" \
+                        "Inspect configuration" \
+                        "Update reverse proxy" \
+                        "Disable domain" \
+                        "Cancel"
+                )"
+            fi
 
             case "$action" in
                 "Inspect configuration") inspect_domain_config "$domain" ;;
                 "Update reverse proxy") configure_reverse_proxy "$domain" ;;
+                "Enable SSL / HTTPS")
+                    if ! ssl_setup_domain "$domain"; then
+                        error "SSL certificate setup failed."
+                        warning "HTTP remains active."
+                    fi
+                    ;;
                 "Disable domain") disable_domain "$domain" ;;
                 "Cancel") warning "Domain configuration cancelled." ;;
             esac

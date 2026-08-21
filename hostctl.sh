@@ -14,6 +14,7 @@ INIT_LIB="${SCRIPT_DIR}/lib/init.sh"
 SYSTEM_LIB="${SCRIPT_DIR}/lib/system.sh"
 DOCKER_LIB="${SCRIPT_DIR}/lib/docker.sh"
 NGINX_LIB="${SCRIPT_DIR}/lib/nginx.sh"
+SSL_LIB="${SCRIPT_DIR}/lib/ssl.sh"
 
 # ---------------------------------------------------------
 # Load required libraries
@@ -54,6 +55,13 @@ fi
 
 # shellcheck source=lib/nginx.sh
 source "$NGINX_LIB"
+
+if [[ ! -f "$SSL_LIB" ]]; then
+    die "Missing required library: $SSL_LIB"
+fi
+
+# shellcheck source=lib/ssl.sh
+source "$SSL_LIB"
 
 # ---------------------------------------------------------
 # Help
@@ -365,8 +373,12 @@ case "$COMMAND" in
         ;;
 
     # SSL
-    --ssl|--ssl-status)
-        die "${COMMAND} is not implemented yet."
+    --ssl)
+        cmd_ssl "$@"
+        ;;
+
+    --ssl-status)
+        cmd_ssl_status "$@"
         ;;
 
     # Firewall
