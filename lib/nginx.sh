@@ -260,6 +260,7 @@ detect_nginx_domains() {
     {
         extract_domains_from_config_dir "$NGINX_SITES_ENABLED"
         extract_domains_from_config_dir "$NGINX_SITES_AVAILABLE"
+        extract_domains_from_config_dir "$NGINX_CONF_D"
     } | sort -u
 }
 
@@ -324,6 +325,7 @@ select_nginx_domain() {
     local domain
     local choice
     local max_choice
+    local status
 
     while IFS= read -r domain; do
         [[ -n "$domain" ]] && validate_domain "$domain" && domains+=("$domain")
@@ -345,7 +347,8 @@ select_nginx_domain() {
 
     local i
     for i in "${!domains[@]}"; do
-        printf '%d. %s\n' "$((i + 1))" "${domains[$i]}" >&2
+        status="$(domain_status_label "${domains[$i]}")"
+        printf '%d. %s [%s]\n' "$((i + 1))" "${domains[$i]}" "$status" >&2
     done
 
     max_choice="${#domains[@]}"
@@ -445,6 +448,217 @@ find_enabled_domain_owner() {
                 return 0
             fi
         done
+}
+
+expand_nginx_include_pattern() {
+    local pattern="$1"
+    local file
+
+    [[ "$pattern" == /* ]] || return 0
+
+    if [[ "$pattern" == *"*"* || "$pattern" == *"?"* || "$pattern" == *"["* ]]; then
+        compgen -G "$pattern" |
+            while IFS= read -r file; do
+                [[ -f "$file" || -L "$file" ]] && printf '%s\n' "$file"
+            done
+    elif [[ -f "$pattern" || -L "$pattern" ]]; then
+        printf '%s\n' "$pattern"
+    fi
+}
+
+nginx_included_config_paths() {
+    local include_path
+
+    {
+        if [[ -d "$NGINX_SITES_ENABLED" ]]; then
+            find "$NGINX_SITES_ENABLED" -maxdepth 1 \( -type f -o -type l \) -print
+        fi
+
+        if [[ -d "$NGINX_CONF_D" ]]; then
+            find "$NGINX_CONF_D" -maxdepth 1 -type f -name '*.conf' -print
+        fi
+
+        if [[ -f "$NGINX_CONF" ]]; then
+            awk '
+                /^[[:space:]]*#/ { next }
+                /include[[:space:]]/ {
+                    for (i = 1; i <= NF; i++) {
+                        if ($i == "include") {
+                            path = $(i + 1);
+                            gsub(/;/, "", path);
+                            print path;
+                        }
+                    }
+                }
+            ' "$NGINX_CONF" |
+                while IFS= read -r include_path; do
+                    expand_nginx_include_pattern "$include_path"
+                done
+        fi
+    } | awk 'NF && !seen[$0]++'
+}
+
+config_listeners_for_domain() {
+    local file="$1"
+    local domain="$2"
+
+    awk -v domain="$domain" '
+        BEGIN { in_server = 0; depth = 0; has_domain = 0; listeners = "" }
+        /server[[:space:]]*\{/ {
+            in_server = 1;
+            line = $0;
+            opens = gsub(/\{/, "{", line);
+            line = $0;
+            closes = gsub(/\}/, "}", line);
+            depth = opens - closes;
+            has_domain = 0;
+            listeners = "";
+        }
+        in_server {
+            line = $0;
+            opens = gsub(/\{/, "{", line);
+            closes = gsub(/\}/, "}", line);
+            if ($0 !~ /server[[:space:]]*\{/) depth += opens - closes;
+
+            if ($0 ~ /listen[[:space:]]/) {
+                value = $0;
+                sub(/^[[:space:]]*listen[[:space:]]+/, "", value);
+                gsub(/;/, "", value);
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value);
+                listeners = listeners ? listeners ", " value : value;
+            }
+
+            if ($0 ~ /server_name[[:space:]]/) {
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "server_name") {
+                        for (j = i + 1; j <= NF; j++) {
+                            name = $j;
+                            gsub(/;/, "", name);
+                            if (name == domain) has_domain = 1;
+                            if ($j ~ /;/) break;
+                        }
+                    }
+                }
+            }
+
+            if (depth <= 0) {
+                if (has_domain) print listeners ? listeners : "unspecified";
+                in_server = 0;
+            }
+        }
+    ' "$file" | paste -sd ', ' -
+}
+
+config_other_domains() {
+    local file="$1"
+    local domain="$2"
+
+    extract_server_names_from_file "$file" |
+        awk -v domain="$domain" '$0 != domain && $0 != "_" { print }' |
+        sort -u
+}
+
+config_certificates_for_domain() {
+    local file="$1"
+    local domain="$2"
+    local certs=""
+
+    if [[ -f "$file" ]]; then
+        certs="$(awk '/ssl_certificate[[:space:]]/ && $1 == "ssl_certificate" { gsub(/;/, "", $2); print $2 }' "$file" | sort -u | paste -sd ', ' -)"
+    fi
+
+    if [[ -z "$certs" && -d "/etc/letsencrypt/live/${domain}" ]]; then
+        certs="/etc/letsencrypt/live/${domain}"
+    fi
+
+    [[ -n "$certs" ]] && printf '%s\n' "$certs" || printf 'not detected\n'
+}
+
+active_domain_config_records() {
+    local domain="$1"
+    local active_path
+    local real_path
+    local listeners
+    local other_domains
+
+    nginx_included_config_paths |
+        while IFS= read -r active_path; do
+            is_ignored_nginx_config_path "$active_path" && continue
+            real_path="$(real_config_path "$active_path" 2>/dev/null || true)"
+            [[ -n "$real_path" && -f "$real_path" ]] || continue
+            is_ignored_nginx_config_path "$real_path" && continue
+            config_declares_domain "$real_path" "$domain" || continue
+            listeners="$(config_listeners_for_domain "$real_path" "$domain")"
+            other_domains="$(config_other_domains "$real_path" "$domain" | paste -sd ',' -)"
+            printf '%s|%s|%s|%s\n' "$active_path" "$real_path" "${listeners:-unspecified}" "$other_domains"
+        done | awk -F'|' '!seen[$1 "|" $2]++'
+}
+
+domain_source_config_paths() {
+    local domain="$1"
+    local file
+
+    {
+        if [[ -d "$NGINX_SITES_AVAILABLE" ]]; then
+            find "$NGINX_SITES_AVAILABLE" -maxdepth 1 -type f -print
+        fi
+        if [[ -d "$NGINX_CONF_D" ]]; then
+            find "$NGINX_CONF_D" -maxdepth 1 -type f -name '*.conf.disabled' -print
+        fi
+    } |
+        while IFS= read -r file; do
+            is_ignored_nginx_config_path "$file" && continue
+            [[ -f "$file" ]] || continue
+            config_declares_domain "$file" "$domain" && printf '%s\n' "$file"
+        done | awk '!seen[$0]++'
+}
+
+domain_has_http_active() {
+    active_domain_config_records "$1" | awk -F'|' '$3 ~ /(^|, )[[]?::[]]?:?80([ ,]|$)|(^|, )80([ ,]|$)/ { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+domain_has_https_active() {
+    active_domain_config_records "$1" | awk -F'|' '$3 ~ /443|ssl/ { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+domain_is_active() {
+    active_domain_config_records "$1" | grep -q .
+}
+
+domain_config_exists() {
+    domain_source_config_paths "$1" | grep -q .
+}
+
+domain_status_label() {
+    local domain="$1"
+    local http="no"
+    local https="no"
+
+    domain_has_http_active "$domain" && http="yes"
+    domain_has_https_active "$domain" && https="yes"
+
+    if [[ "$http" == "yes" && "$https" == "yes" ]]; then
+        printf 'Active'
+    elif [[ "$http" == "yes" ]]; then
+        printf 'Partial: HTTP active'
+    elif [[ "$https" == "yes" ]]; then
+        printf 'Partial: HTTPS active'
+    else
+        printf 'Disabled'
+    fi
+}
+
+preferred_domain_source_config() {
+    local domain="$1"
+    local path
+
+    path="$(domain_available_path "$domain")"
+    if [[ -f "$path" ]] && config_declares_domain "$path" "$domain"; then
+        printf '%s\n' "$path"
+        return 0
+    fi
+
+    domain_source_config_paths "$domain" | head -n 1
 }
 
 resolve_domain_deployment_target() {
@@ -844,42 +1058,222 @@ restore_conflicting_domain_link() {
 
 inspect_domain_config() {
     local domain="$1"
-    local target
+    local records
+    local record
+    local active_path
+    local real_path
+    local listeners
+    local index=0
+    local status
+    local source_paths
 
-    target="$(domain_available_path "$domain")"
-    if [[ -f "$target" ]]; then
-        sed -n '1,220p' "$target"
+    records="$(active_domain_config_records "$domain")"
+    status="$(domain_status_label "$domain")"
+
+    echo
+    printf 'Domain: %s\n' "$domain"
+    printf 'Status: %s\n' "$status"
+    printf 'HTTP: %s\n' "$(domain_has_http_active "$domain" && printf 'active' || printf 'inactive')"
+    printf 'HTTPS: %s\n' "$(domain_has_https_active "$domain" && printf 'active' || printf 'inactive')"
+
+    if [[ -n "$records" ]]; then
+        echo
+        while IFS= read -r record; do
+            index=$((index + 1))
+            active_path="$(cut -d'|' -f1 <<< "$record")"
+            real_path="$(cut -d'|' -f2 <<< "$record")"
+            listeners="$(cut -d'|' -f3 <<< "$record")"
+
+            printf '%d. Active config: %s\n' "$index" "$active_path"
+            printf '   Source config: %s\n' "$real_path"
+            printf '   HTTP listener: %s\n' "$(grep -Eq '(^|, )[[]?::[]]?:?80([ ,]|$)|(^|, )80([ ,]|$)' <<< "$listeners" && printf 'yes' || printf 'not detected')"
+            printf '   HTTPS listener: %s\n' "$(grep -Eq '443|ssl' <<< "$listeners" && printf 'yes' || printf 'not detected')"
+            printf '   Listeners: %s\n' "$listeners"
+            printf '   Certificate: %s\n' "$(config_certificates_for_domain "$real_path" "$domain")"
+            echo
+        done <<< "$records"
     else
-        warning "No config found for ${domain}."
+        source_paths="$(domain_source_config_paths "$domain")"
+        if [[ -n "$source_paths" ]]; then
+            while IFS= read -r real_path; do
+                printf 'Config: %s\n' "$real_path"
+                printf 'Certificate: %s\n' "$(config_certificates_for_domain "$real_path" "$domain")"
+            done <<< "$source_paths"
+        else
+            warning "No active config found for ${domain}."
+        fi
     fi
 }
 
-disable_domain() {
+enable_domain() {
     local domain="$1"
+    local source
     local enabled
-    local target
+    local conflict
 
-    enabled="$(domain_enabled_path "$domain")"
-    target="$(domain_available_path "$domain")"
+    source="$(preferred_domain_source_config "$domain")"
+    if [[ -z "$source" || ! -f "$source" ]]; then
+        die "No disabled source config found for ${domain}."
+    fi
 
-    if [[ ! -e "$enabled" ]]; then
-        warning "Domain is already disabled: ${domain}"
+    conflict="$(find_enabled_domain_owner "$domain" "$source" | head -n 1 || true)"
+    if [[ -n "$conflict" ]]; then
+        error "Domain ${domain} is already active in: ${conflict%%|*}"
+        error "Resolve the duplicate server_name before enabling this config."
+        return 1
+    fi
+
+    if [[ "$source" == "$NGINX_SITES_AVAILABLE/"* ]]; then
+        enabled="$(domain_enabled_path "$(basename "$source")")"
+    else
+        error "Cannot automatically enable config outside sites-available: ${source}"
+        return 1
+    fi
+
+    if ! confirm "Enable ${domain} using ${source}?" "yes"; then
+        warning "Enable cancelled."
         return 0
     fi
 
-    if ! confirm "Disable ${domain}?" "no"; then
-        warning "Disable cancelled."
+    ln -sfn "$source" "$enabled"
+
+    if nginx_test_and_reload "$domain"; then
+        log_event "NGINX_DOMAIN_ENABLE domain=${domain} result=success source=${source}"
+        success "Domain enabled: ${domain}"
         return 0
     fi
 
     rm -f "$enabled"
-    if nginx_test_and_reload; then
-        log_event "NGINX_DOMAIN_DISABLE domain=${domain} result=success"
-        success "Domain disabled: ${domain}"
+    validate_nginx_config || true
+    log_event "NGINX_DOMAIN_ENABLE domain=${domain} result=failed source=${source}"
+    return 1
+}
+
+delete_domain_config() {
+    local domain="$1"
+    local source
+    local backup
+
+    if domain_is_active "$domain"; then
+        die "Cannot delete active domain config. Disable ${domain} first."
+    fi
+
+    source="$(preferred_domain_source_config "$domain")"
+    if [[ -z "$source" || ! -f "$source" ]]; then
+        warning "No source config found for ${domain}."
         return 0
     fi
 
-    ln -sfn "$target" "$enabled"
+    warning "This removes only the Nginx config, not SSL certificates."
+    if ! confirm "Delete disabled config ${source}?" "no"; then
+        warning "Delete cancelled."
+        return 0
+    fi
+
+    backup="$(backup_file "$source" || true)"
+    rm -f "$source"
+    log_event "NGINX_DOMAIN_DELETE domain=${domain} source=${source} backup=${backup:-none}"
+    success "Deleted disabled config for ${domain}. Backup: ${backup:-none}"
+}
+
+disable_domain() {
+    local domain="$1"
+    local records
+    local record
+    local active_path
+    local real_path
+    local listeners
+    local other_domains
+    local index=0
+    local removed_links=()
+    local moved_files=()
+    local backup_pairs=()
+    local disabled_path
+
+    records="$(active_domain_config_records "$domain")"
+
+    if [[ -z "$records" ]]; then
+        warning "Domain is already disabled: ${domain}"
+        return 0
+    fi
+
+    echo
+    printf 'Domain %s is active in:\n' "$domain"
+    echo
+    while IFS= read -r record; do
+        index=$((index + 1))
+        active_path="$(cut -d'|' -f1 <<< "$record")"
+        listeners="$(cut -d'|' -f3 <<< "$record")"
+        printf '%d. %s\n' "$index" "$active_path"
+        printf '   listeners: %s\n\n' "$listeners"
+    done <<< "$records"
+
+    while IFS= read -r record; do
+        active_path="$(cut -d'|' -f1 <<< "$record")"
+        real_path="$(cut -d'|' -f2 <<< "$record")"
+        other_domains="$(cut -d'|' -f4 <<< "$record")"
+
+        if [[ -n "$other_domains" ]]; then
+            error "Cannot safely disable ${domain}; shared config also declares: ${other_domains}"
+            error "Edit the shared server block safely before using hostctl disable."
+            return 1
+        fi
+
+        if [[ "$active_path" != "$NGINX_SITES_ENABLED/"* && "$active_path" != "$NGINX_CONF_D/"*.conf ]]; then
+            error "Cannot safely disable active config outside sites-enabled/conf.d: ${active_path}"
+            error "Refusing to move an explicitly included config automatically."
+            return 1
+        fi
+    done <<< "$records"
+
+    if ! confirm "Disable all active server configs for this domain?" "no"; then
+        warning "Disable cancelled."
+        return 0
+    fi
+
+    while IFS= read -r record; do
+        active_path="$(cut -d'|' -f1 <<< "$record")"
+        real_path="$(cut -d'|' -f2 <<< "$record")"
+
+        if [[ "$active_path" == "$NGINX_SITES_ENABLED/"* ]]; then
+            removed_links+=("${active_path}|$(readlink "$active_path" 2>/dev/null || printf '%s' "$real_path")")
+            rm -f "$active_path"
+        elif [[ "$active_path" == "$NGINX_CONF_D/"*.conf ]]; then
+            disabled_path="${active_path}.disabled"
+            backup_pairs+=("${active_path}|$(backup_file "$active_path" || true)")
+            moved_files+=("${disabled_path}|${active_path}")
+            mv "$active_path" "$disabled_path"
+        fi
+    done <<< "$records"
+
+    if nginx_test_and_reload "$domain" && ! active_domain_config_records "$domain" | grep -q .; then
+        log_event "NGINX_DOMAIN_DISABLE domain=${domain} result=success"
+        success "Domain disabled on HTTP and HTTPS: ${domain}"
+        return 0
+    fi
+
+    warning "Disable failed or domain is still active; rolling back."
+    local pair
+    local original
+    local link_target
+    for pair in "${removed_links[@]}"; do
+        original="${pair%%|*}"
+        link_target="${pair#*|}"
+        ln -sfn "$link_target" "$original"
+    done
+
+    for pair in "${moved_files[@]}"; do
+        disabled_path="${pair%%|*}"
+        original="${pair#*|}"
+        [[ -e "$disabled_path" ]] && mv "$disabled_path" "$original"
+    done
+
+    for pair in "${backup_pairs[@]}"; do
+        original="${pair%%|*}"
+        link_target="${pair#*|}"
+        [[ -n "$link_target" && -f "$link_target" ]] && rollback_file "$link_target" "$original" || true
+    done
+
     validate_nginx_config || true
     log_event "NGINX_DOMAIN_DISABLE domain=${domain} result=failed"
     return 1
@@ -911,28 +1305,51 @@ cmd_domain() {
 
     local domain
     local action
+    local status
 
     domain="$(select_nginx_domain "yes")"
+    status="$(domain_status_label "$domain")"
 
-    if hostctl_domain_exists "$domain"; then
+    if domain_config_exists "$domain" || domain_is_active "$domain"; then
         echo
-        echo "Domain already exists."
+        printf 'Domain state: %s\n' "$status"
         echo
-        action="$(
-            select_option \
-                "Domain action:" \
-                "Inspect configuration" \
-                "Update reverse proxy" \
-                "Disable domain" \
-                "Cancel"
-        )"
 
-        case "$action" in
-            "Inspect configuration") inspect_domain_config "$domain" ;;
-            "Update reverse proxy") configure_reverse_proxy "$domain" ;;
-            "Disable domain") disable_domain "$domain" ;;
-            "Cancel") warning "Domain configuration cancelled." ;;
-        esac
+        if domain_is_active "$domain"; then
+            action="$(
+                select_option \
+                    "Domain action:" \
+                    "Inspect configuration" \
+                    "Update reverse proxy" \
+                    "Disable domain" \
+                    "Cancel"
+            )"
+
+            case "$action" in
+                "Inspect configuration") inspect_domain_config "$domain" ;;
+                "Update reverse proxy") configure_reverse_proxy "$domain" ;;
+                "Disable domain") disable_domain "$domain" ;;
+                "Cancel") warning "Domain configuration cancelled." ;;
+            esac
+        else
+            action="$(
+                select_option \
+                    "Domain action:" \
+                    "Inspect configuration" \
+                    "Update configuration" \
+                    "Enable domain" \
+                    "Delete configuration" \
+                    "Cancel"
+            )"
+
+            case "$action" in
+                "Inspect configuration") inspect_domain_config "$domain" ;;
+                "Update configuration") configure_reverse_proxy "$domain" ;;
+                "Enable domain") enable_domain "$domain" ;;
+                "Delete configuration") delete_domain_config "$domain" ;;
+                "Cancel") warning "Domain configuration cancelled." ;;
+            esac
+        fi
     else
         configure_reverse_proxy "$domain"
         disable_default_site_if_requested || true
@@ -1083,84 +1500,20 @@ remove_managed_nginx_file() {
     return 1
 }
 
-render_rate_zone_config() {
-    local rate="$1"
-    local output="$2"
-
-    cat > "$output" <<EOF
-# Managed by hostctl
-limit_req_zone \$binary_remote_addr zone=hostctl_api:10m rate=${rate}r/s;
-EOF
-}
-
-ensure_domain_location_marker() {
+rate_zone_name() {
     local domain="$1"
-    local directive="$2"
-    local target
-    local temp_file
-    local backup=""
 
-    target="$(domain_available_path "$domain")"
-    [[ -f "$target" ]] || die "Domain config not found: ${target}"
-
-    backup="$(backup_file "$target" || true)"
-    temp_file="$(mktemp)"
-
-    awk -v directive="$directive" '
-        BEGIN { inserted = 0 }
-        /location[[:space:]]+\/[[:space:]]*\{/ && inserted == 0 {
-            print;
-            print "        # Managed by hostctl";
-            print "        " directive;
-            inserted = 1;
-            next;
-        }
-        { print }
-        END { if (inserted == 0) exit 2 }
-    ' "$target" > "$temp_file"
-
-    local awk_status=$?
-    if [[ "$awk_status" -eq 2 ]]; then
-        rm -f "$temp_file"
-        die "Could not find a location / block in ${target}."
-    elif [[ "$awk_status" -ne 0 ]]; then
-        rm -f "$temp_file"
-        return 1
-    fi
-
-    if grep -Fq "$directive" "$target"; then
-        rm -f "$temp_file"
-        warning "Directive already present for ${domain}."
-        return 0
-    fi
-
-    cp "$temp_file" "$target"
-    rm -f "$temp_file"
-
-    if nginx_test_and_reload; then
-        success "Domain updated: ${domain}"
-        return 0
-    fi
-
-    rollback_file "$backup" "$target" || true
-    validate_nginx_config || true
-    return 1
+    printf 'hostctl_%s\n' "$domain" | tr '.-' '__' | tr -cd 'A-Za-z0-9_'
 }
 
-cmd_nginx_rate_limit() {
-    require_root
-    require_debian_based
-    ensure_nginx_installed
-
+select_rate_profile() {
     local profile
     local rate
     local burst
-    local domain
-    local temp_file
 
     profile="$(
         select_option \
-            "Rate limit profile:" \
+            "Rate profile:" \
             "Conservative" \
             "Balanced" \
             "Strict" \
@@ -1185,84 +1538,584 @@ cmd_nginx_rate_limit() {
             ;;
     esac
 
-    domain="$(select_nginx_domain "no")"
-    warning "Rate limiting will be applied only to ${domain}."
-    if ! confirm "Continue?" "yes"; then
+    printf '%s|%s\n' "$rate" "$burst"
+}
+
+managed_rule_files() {
+    local file
+
+    printf '%s\n' "$HOSTCTL_NGINX_BLOCKED_IPS_CONF"
+    printf '%s\n' "$HOSTCTL_NGINX_ALLOWED_IPS_CONF"
+    printf '%s\n' "$HOSTCTL_NGINX_RATE_ZONE_CONF"
+
+    if [[ -d "$NGINX_SITES_AVAILABLE" ]]; then
+        find "$NGINX_SITES_AVAILABLE" -maxdepth 1 -type f -print |
+            while IFS= read -r file; do
+                is_ignored_nginx_config_path "$file" && continue
+                printf '%s\n' "$file"
+            done
+    fi
+}
+
+marker_field() {
+    local marker="$1"
+    local key="$2"
+
+    tr ':' '\n' <<< "$marker" |
+        awk -F= -v key="$key" '$1 == key { print substr($0, length(key) + 2); exit }'
+}
+
+marker_scope() {
+    local marker="$1"
+    local domain
+    local scope
+
+    scope="$(marker_field "$marker" scope)"
+    domain="$(marker_field "$marker" domain)"
+
+    if [[ -n "$domain" ]]; then
+        printf '%s\n' "$domain"
+    elif [[ -n "$scope" ]]; then
+        printf '%s\n' "$scope"
+    else
+        printf 'unknown\n'
+    fi
+}
+
+rule_record_matches_kind() {
+    local marker="$1"
+    local kind="$2"
+
+    case "$kind" in
+        block) [[ "$marker" == "# HOSTCTL:BLOCK-IP:"* ]] ;;
+        allow) [[ "$marker" == "# HOSTCTL:ALLOW-IP:"* ]] ;;
+        rate) [[ "$marker" == "# HOSTCTL:RATE-LIMIT:"* ]] ;;
+        zone) [[ "$marker" == "# HOSTCTL:RATE-ZONE:"* ]] ;;
+        allow-only) [[ "$marker" == "# HOSTCTL:ALLOW-ONLY:"* ]] ;;
+    esac
+}
+
+collect_managed_rules() {
+    local kind="$1"
+    local file
+    local line_no
+    local line
+    local scope
+    local value
+    local rate
+    local burst
+    local zone
+    local mode
+
+    while IFS= read -r file; do
+        [[ -f "$file" ]] || continue
+        line_no=0
+        while IFS= read -r line; do
+            line_no=$((line_no + 1))
+            line="${line#"${line%%[![:space:]]*}"}"
+            rule_record_matches_kind "$line" "$kind" || continue
+
+            scope="$(marker_scope "$line")"
+            value="$(marker_field "$line" value)"
+            rate="$(marker_field "$line" rate)"
+            burst="$(marker_field "$line" burst)"
+            zone="$(marker_field "$line" zone)"
+            mode="trusted only"
+            if [[ "$kind" == "allow" ]] && has_allow_only_for_scope "$scope"; then
+                mode="allow-only"
+            fi
+            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$kind" "$file" "$line_no" "$scope" "$value" "$rate" "$burst" "$zone" "$mode"
+        done < "$file"
+    done < <(managed_rule_files)
+}
+
+has_allow_only_for_scope() {
+    local scope="$1"
+    local file
+    local line
+
+    while IFS= read -r file; do
+        [[ -f "$file" ]] || continue
+        while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            [[ "$line" == "# HOSTCTL:ALLOW-ONLY:"* ]] || continue
+            [[ "$(marker_scope "$line")" == "$scope" ]] && return 0
+        done < "$file"
+    done < <(managed_rule_files)
+
+    return 1
+}
+
+count_allow_rules_for_scope() {
+    local scope="$1"
+
+    collect_managed_rules allow | awk -F'|' -v scope="$scope" '$4 == scope { count++ } END { print count + 0 }'
+}
+
+print_rule_records() {
+    local kind="$1"
+    local title="$2"
+    local records
+    local index=0
+    local record
+    local scope
+    local value
+    local rate
+    local burst
+    local mode
+
+    records="$(collect_managed_rules "$kind")"
+    echo
+    echo "$title"
+    echo
+
+    if [[ -z "$records" ]]; then
+        case "$kind" in
+            block) echo "No hostctl-managed blocked IP rules found." ;;
+            allow) echo "No hostctl-managed whitelist rules found." ;;
+            rate) echo "No hostctl-managed rate limits found." ;;
+        esac
+        return 1
+    fi
+
+    while IFS= read -r record; do
+        index=$((index + 1))
+        scope="$(cut -d'|' -f4 <<< "$record")"
+        value="$(cut -d'|' -f5 <<< "$record")"
+        rate="$(cut -d'|' -f6 <<< "$record")"
+        burst="$(cut -d'|' -f7 <<< "$record")"
+        mode="$(cut -d'|' -f9 <<< "$record")"
+
+        case "$kind" in
+            block)
+                printf '%d. %s\n' "$index" "$value"
+                printf '   Scope: %s\n\n' "$scope"
+                ;;
+            allow)
+                printf '%d. %s\n' "$index" "$value"
+                printf '   Scope: %s\n' "$scope"
+                printf '   Mode: %s\n\n' "$mode"
+                ;;
+            rate)
+                printf '%d. %s\n' "$index" "$scope"
+                printf '   Rate: %s req/s\n' "$rate"
+                printf '   Burst: %s\n\n' "$burst"
+                ;;
+        esac
+    done <<< "$records"
+}
+
+select_managed_rule() {
+    local kind="$1"
+    local title="$2"
+    local records
+    local count
+    local choice
+
+    records="$(collect_managed_rules "$kind")"
+    if [[ -z "$records" ]]; then
+        print_rule_records "$kind" "$title" || true
+        return 1
+    fi
+
+    print_rule_records "$kind" "$title" || true
+    count="$(wc -l <<< "$records" | tr -d '[:space:]')"
+
+    while true; do
+        read -r -p "Select [1-${count}]: " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= count )); then
+            sed -n "${choice}p" <<< "$records"
+            return 0
+        fi
+        warning "Invalid selection."
+    done
+}
+
+domain_config_for_rule_scope() {
+    local scope="$1"
+    local owner
+
+    [[ "$scope" != "global" ]] || return 1
+
+    if ! assert_single_enabled_domain_owner "$scope"; then
+        return 1
+    fi
+
+    owner="$(find_enabled_domain_owner "$scope" | head -n 1 || true)"
+    if [[ -n "$owner" ]]; then
+        printf '%s\n' "${owner#*|}"
+    else
+        domain_available_path "$scope"
+    fi
+}
+
+assert_single_enabled_domain_owner() {
+    local domain="$1"
+    local matches
+    local count
+
+    matches="$(find_enabled_domain_owner "$domain" || true)"
+    count=0
+    [[ -n "$matches" ]] && count="$(wc -l <<< "$matches" | tr -d '[:space:]')"
+    if (( count > 1 )); then
+        error "Domain ${domain} is configured in multiple enabled Nginx configs."
+        error "Resolve the server-name conflict before modifying access rules."
+        return 1
+    fi
+    return 0
+}
+
+apply_nginx_file_updates() {
+    local log_name="$1"
+    local domain="${2:-}"
+    shift 2
+    local files=("$@")
+    local backups=()
+    local file
+    local backup
+
+    for file in "${files[@]}"; do
+        [[ -n "$file" ]] || continue
+        if [[ -f "$file" ]]; then
+            backup="$(backup_file "$file" || true)"
+        else
+            backup=""
+        fi
+        backups+=("${file}|${backup}")
+    done
+
+    if nginx_test_and_reload "$domain"; then
+        log_event "${log_name} result=success domain=${domain:-none}"
+        return 0
+    fi
+
+    warning "Nginx validation failed; rolling back."
+    local pair
+    for pair in "${backups[@]}"; do
+        file="${pair%%|*}"
+        backup="${pair#*|}"
+        restore_file_backup "$backup" "$file"
+    done
+    validate_nginx_config || true
+    log_event "${log_name} result=failed domain=${domain:-none}"
+    return 1
+}
+
+replace_file_from_temp_with_validation() {
+    local target="$1"
+    local temp_file="$2"
+    local log_name="$3"
+    local domain="${4:-}"
+    local backup=""
+
+    [[ -f "$target" ]] && backup="$(backup_file "$target" || true)"
+    cp "$temp_file" "$target" || return 1
+
+    if nginx_test_and_reload "$domain"; then
+        log_event "${log_name} result=success target=${target} domain=${domain:-none}"
+        return 0
+    fi
+
+    warning "Nginx validation failed; rolling back."
+    restore_file_backup "$backup" "$target"
+    validate_nginx_config || true
+    log_event "${log_name} result=failed target=${target} domain=${domain:-none}"
+    return 1
+}
+
+insert_managed_block_in_location() {
+    local target="$1"
+    local marker="$2"
+    local directive="$3"
+    local log_name="$4"
+    local domain="$5"
+    local temp_file
+
+    [[ -f "$target" ]] || die "Domain config not found: ${target}"
+
+    if grep -Fq "$marker" "$target"; then
+        warning "Managed rule already exists."
         return 0
     fi
 
     temp_file="$(mktemp)"
-    render_rate_zone_config "$rate" "$temp_file"
-    write_managed_file_with_rollback "$HOSTCTL_NGINX_RATE_ZONE_CONF" "$temp_file" "NGINX_RATE_LIMIT" || {
+    awk -v marker="$marker" -v directive="$directive" '
+        BEGIN { inserted = 0 }
+        /location[[:space:]]+\/[[:space:]]*\{/ && inserted == 0 {
+            print;
+            print "        " marker;
+            print "        " directive;
+            inserted = 1;
+            next;
+        }
+        { print }
+        END { if (inserted == 0) exit 2 }
+    ' "$target" > "$temp_file"
+    local awk_status=$?
+    if [[ "$awk_status" -eq 2 ]]; then
+        rm -f "$temp_file"
+        die "Could not find a location / block in ${target}."
+    elif [[ "$awk_status" -ne 0 ]]; then
         rm -f "$temp_file"
         return 1
-    }
-    rm -f "$temp_file"
-
-    ensure_domain_location_marker "$domain" "limit_req zone=hostctl_api burst=${burst} nodelay;" || return 1
-    log_event "NGINX_RATE_LIMIT domain=${domain} rate=${rate} burst=${burst} result=success"
-}
-
-# ---------------------------------------------------------
-# IP access controls
-# ---------------------------------------------------------
-
-warn_real_ip_if_needed() {
-    if ! grep -RqsE 'real_ip_header|set_real_ip_from' "$NGINX_ROOT"; then
-        warning "No real-IP proxy configuration detected."
-        warning "If this server is behind Cloudflare or a load balancer, Nginx may see proxy IPs instead of client IPs."
     fi
+
+    replace_file_from_temp_with_validation "$target" "$temp_file" "$log_name" "$domain"
+    local result=$?
+    rm -f "$temp_file"
+    return "$result"
 }
 
-append_unique_rule_file() {
+append_managed_global_rule() {
     local target="$1"
-    local rule="$2"
-    local log_name="$3"
+    local marker="$2"
+    local directive="$3"
+    local log_name="$4"
     local temp_file
-    local backup=""
 
-    [[ -f "$target" ]] && backup="$(backup_file "$target" || true)"
     temp_file="$(mktemp)"
-
     if [[ -f "$target" ]]; then
         cp "$target" "$temp_file"
     else
         printf '# Managed by hostctl\n' > "$temp_file"
     fi
 
-    if grep -Fxq "$rule" "$temp_file"; then
-        warning "Rule already exists: ${rule}"
+    if grep -Fq "$marker" "$temp_file"; then
+        warning "Managed rule already exists."
         rm -f "$temp_file"
         return 0
     fi
 
-    printf '%s\n' "$rule" >> "$temp_file"
-    cp "$temp_file" "$target"
+    printf '%s\n%s\n' "$marker" "$directive" >> "$temp_file"
+    replace_file_from_temp_with_validation "$target" "$temp_file" "$log_name"
+    local result=$?
     rm -f "$temp_file"
+    return "$result"
+}
 
-    if nginx_test_and_reload; then
-        log_event "${log_name} rule=${rule} result=success"
-        success "Rule applied: ${rule}"
+remove_marker_pair_from_file() {
+    local file="$1"
+    local marker_line="$2"
+    local temp_file
+
+    temp_file="$(mktemp)"
+    awk -v marker="$marker_line" '
+        $0 == marker { skip = 1; next }
+        skip == 1 { skip = 0; next }
+        { print }
+    ' "$file" > "$temp_file"
+    printf '%s\n' "$temp_file"
+}
+
+replace_marker_pair_in_file() {
+    local file="$1"
+    local old_marker="$2"
+    local new_marker="$3"
+    local new_directive="$4"
+    local temp_file
+
+    temp_file="$(mktemp)"
+    awk -v old_marker="$old_marker" -v new_marker="$new_marker" -v new_directive="$new_directive" '
+        $0 == old_marker {
+            print new_marker;
+            print new_directive;
+            skip = 1;
+            next
+        }
+        skip == 1 { skip = 0; next }
+        { print }
+    ' "$file" > "$temp_file"
+    printf '%s\n' "$temp_file"
+}
+
+remove_allow_only_for_scope() {
+    local scope="$1"
+    local file
+    local temp_file
+    local changed="no"
+
+    while IFS= read -r file; do
+        [[ -f "$file" ]] || continue
+        if awk -v domain_marker="# HOSTCTL:ALLOW-ONLY:domain=${scope}" -v scope_marker="# HOSTCTL:ALLOW-ONLY:scope=${scope}" '
+            { line = $0; sub(/^[[:space:]]+/, "", line) }
+            line == domain_marker || line == scope_marker { found = 1 }
+            END { exit found ? 0 : 1 }
+        ' "$file"; then
+            temp_file="$(mktemp)"
+            awk -v domain_marker="# HOSTCTL:ALLOW-ONLY:domain=${scope}" -v scope_marker="# HOSTCTL:ALLOW-ONLY:scope=${scope}" '
+                {
+                    line = $0;
+                    sub(/^[[:space:]]+/, "", line);
+                }
+                line == domain_marker || line == scope_marker { skip = 1; next }
+                skip == 1 { skip = 0; next }
+                { print }
+            ' "$file" > "$temp_file"
+            cp "$temp_file" "$file"
+            rm -f "$temp_file"
+            changed="yes"
+        fi
+    done < <(managed_rule_files)
+
+    [[ "$changed" == "yes" ]]
+}
+
+add_allow_only_for_scope() {
+    local scope="$1"
+    local target="$2"
+    local marker
+
+    if [[ "$scope" == "global" ]]; then
+        marker="# HOSTCTL:ALLOW-ONLY:scope=global"
+    else
+        marker="# HOSTCTL:ALLOW-ONLY:domain=${scope}"
+    fi
+
+    if grep -Fq "$marker" "$target"; then
         return 0
     fi
 
-    restore_file_backup "$backup" "$target"
-    validate_nginx_config || true
-    log_event "${log_name} rule=${rule} result=failed"
-    return 1
+    if [[ "$scope" == "global" ]]; then
+        printf '%s\ndeny all;\n' "$marker" >> "$target"
+    else
+        insert_managed_block_in_location "$target" "$marker" "deny all;" "NGINX_ALLOW_IP_ADD" "$scope"
+    fi
 }
 
-append_unique_domain_rule() {
-    local domain="$1"
-    local rule="$2"
-    local log_name="$3"
-
-    ensure_domain_location_marker "$domain" "$rule" || return 1
-    log_event "${log_name} domain=${domain} rule=${rule} result=success"
+warn_real_ip_if_needed() {
+    if ! grep -RqsE 'real_ip_header|set_real_ip_from' "$NGINX_ROOT"; then
+        warning "No real client IP configuration detected."
+        warning "If this server is behind Cloudflare, a reverse proxy, or load balancer,"
+        warning "Nginx may see the proxy IP instead of the actual client IP."
+    fi
 }
 
 select_ip_scope() {
     select_option "$1" "Globally" "Specific domain"
+}
+
+select_scope_for_rule() {
+    local current_scope="${1:-}"
+    local action
+    local domain
+
+    if [[ -n "$current_scope" ]]; then
+        action="$(
+            select_option \
+                "Scope:" \
+                "Keep current scope" \
+                "Move to global" \
+                "Move to another domain"
+        )"
+
+        case "$action" in
+            "Keep current scope") printf '%s\n' "$current_scope" ;;
+            "Move to global") printf 'global\n' ;;
+            "Move to another domain")
+                domain="$(select_nginx_domain "no")"
+                assert_single_enabled_domain_owner "$domain" || return 1
+                printf '%s\n' "$domain"
+                ;;
+        esac
+    else
+        action="$(select_ip_scope "Scope:")"
+        if [[ "$action" == "Globally" ]]; then
+            printf 'global\n'
+        else
+            domain="$(select_nginx_domain "no")"
+            assert_single_enabled_domain_owner "$domain" || return 1
+            printf '%s\n' "$domain"
+        fi
+    fi
+}
+
+target_for_scope() {
+    local scope="$1"
+    local type="$2"
+
+    if [[ "$scope" == "global" ]]; then
+        case "$type" in
+            block) printf '%s\n' "$HOSTCTL_NGINX_BLOCKED_IPS_CONF" ;;
+            allow) printf '%s\n' "$HOSTCTL_NGINX_ALLOWED_IPS_CONF" ;;
+        esac
+    else
+        domain_config_for_rule_scope "$scope"
+    fi
+}
+
+add_block_ip_rule() {
+    local scope="$1"
+    local value="$2"
+    local target
+    local marker
+    local directive
+
+    target="$(target_for_scope "$scope" block)" || return 1
+    directive="deny ${value};"
+    if [[ "$scope" == "global" ]]; then
+        marker="# HOSTCTL:BLOCK-IP:scope=global:value=${value}"
+        append_managed_global_rule "$target" "$marker" "$directive" "NGINX_BLOCK_IP_ADD"
+    else
+        marker="# HOSTCTL:BLOCK-IP:domain=${scope}:value=${value}"
+        insert_managed_block_in_location "$target" "$marker" "$directive" "NGINX_BLOCK_IP_ADD" "$scope"
+    fi
+}
+
+add_allow_ip_rule() {
+    local scope="$1"
+    local value="$2"
+    local mode="$3"
+    local target
+    local marker
+    local directive
+    local backup=""
+    local temp_file
+
+    target="$(target_for_scope "$scope" allow)" || return 1
+    directive="allow ${value};"
+    if [[ "$mode" == "allow-only" ]]; then
+        warning "This mode will deny all clients except allowed addresses."
+        confirm "Continue?" "no" || return 0
+    fi
+
+    if [[ "$scope" == "global" ]]; then
+        marker="# HOSTCTL:ALLOW-IP:scope=global:value=${value}"
+        temp_file="$(mktemp)"
+        [[ -f "$target" ]] && cp "$target" "$temp_file" || printf '# Managed by hostctl\n' > "$temp_file"
+        grep -Fq "$marker" "$temp_file" || printf '%s\n%s\n' "$marker" "$directive" >> "$temp_file"
+        if [[ "$mode" == "allow-only" ]] && ! grep -Fq "# HOSTCTL:ALLOW-ONLY:scope=global" "$temp_file"; then
+            printf '# HOSTCTL:ALLOW-ONLY:scope=global\ndeny all;\n' >> "$temp_file"
+        fi
+        replace_file_from_temp_with_validation "$target" "$temp_file" "NGINX_ALLOW_IP_ADD"
+        local result=$?
+        rm -f "$temp_file"
+        return "$result"
+    else
+        marker="# HOSTCTL:ALLOW-IP:domain=${scope}:value=${value}"
+        insert_managed_block_in_location "$target" "$marker" "$directive" "NGINX_ALLOW_IP_ADD" "$scope" || return 1
+        if [[ "$mode" == "allow-only" ]] && ! has_allow_only_for_scope "$scope"; then
+            backup="$(backup_file "$target" || true)"
+            temp_file="$(mktemp)"
+            awk -v marker="# HOSTCTL:ALLOW-ONLY:domain=${scope}" '
+                BEGIN { inserted = 0 }
+                /location[[:space:]]+\/[[:space:]]*\{/ && inserted == 0 {
+                    print;
+                    print "        " marker;
+                    print "        deny all;";
+                    inserted = 1;
+                    next
+                }
+                { print }
+            ' "$target" > "$temp_file"
+            cp "$temp_file" "$target"
+            rm -f "$temp_file"
+            nginx_test_and_reload "$scope" || {
+                rollback_file "$backup" "$target" || true
+                validate_nginx_config || true
+                return 1
+            }
+        fi
+    fi
 }
 
 cmd_nginx_block_ip() {
@@ -1270,28 +2123,99 @@ cmd_nginx_block_ip() {
     require_debian_based
     ensure_nginx_installed
 
+    local action
     local scope
     local value
-    local domain
-    local rule
+
+    action="$(select_option "IP Blocking" "Add rule" "List rules" "Edit rule" "Remove rule")"
+    case "$action" in
+        "List rules") cmd_nginx_block_ip_list; return ;;
+        "Edit rule") cmd_nginx_block_ip_edit; return ;;
+        "Remove rule") cmd_nginx_block_ip_remove; return ;;
+    esac
 
     warn_real_ip_if_needed
-    scope="$(select_ip_scope "Block IP:")"
-
+    scope="$(select_scope_for_rule)" || return 1
     while true; do
         value="$(ask_input "IP or CIDR")"
         validate_ip_or_cidr "$value" && break
         warning "Invalid IP/CIDR."
     done
+    add_block_ip_rule "$scope" "$value"
+}
 
-    rule="deny ${value};"
+cmd_nginx_block_ip_list() {
+    require_root
+    require_debian_based
+    ensure_nginx_installed
+    print_rule_records block "Blocked IP Rules" || true
+}
 
-    if [[ "$scope" == "Globally" ]]; then
-        append_unique_rule_file "$HOSTCTL_NGINX_BLOCKED_IPS_CONF" "$rule" "NGINX_BLOCK_IP"
-    else
-        domain="$(select_nginx_domain "no")"
-        append_unique_domain_rule "$domain" "$rule" "NGINX_BLOCK_IP"
-    fi
+cmd_nginx_block_ip_edit() {
+    require_root
+    require_debian_based
+    ensure_nginx_installed
+
+    local record
+    local file
+    local line_no
+    local scope
+    local old_value
+    local new_value
+    local new_scope
+    local old_marker
+    local temp_file
+
+    record="$(select_managed_rule block "Blocked IP Rules")" || return 0
+    file="$(cut -d'|' -f2 <<< "$record")"
+    line_no="$(cut -d'|' -f3 <<< "$record")"
+    scope="$(cut -d'|' -f4 <<< "$record")"
+    old_value="$(cut -d'|' -f5 <<< "$record")"
+    old_marker="$(sed -n "${line_no}p" "$file")"
+
+    echo "Current IP/CIDR: ${old_value}"
+    while true; do
+        new_value="$(ask_input "New IP/CIDR" "$old_value")"
+        validate_ip_or_cidr "$new_value" && break
+        warning "Invalid IP/CIDR."
+    done
+    new_scope="$(select_scope_for_rule "$scope")" || return 1
+
+    temp_file="$(remove_marker_pair_from_file "$file" "$old_marker")"
+    replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_BLOCK_IP_EDIT" "$([[ "$scope" != "global" ]] && printf '%s' "$scope")" || {
+        rm -f "$temp_file"
+        return 1
+    }
+    rm -f "$temp_file"
+    add_block_ip_rule "$new_scope" "$new_value"
+}
+
+cmd_nginx_block_ip_remove() {
+    require_root
+    require_debian_based
+    ensure_nginx_installed
+
+    local record
+    local file
+    local line_no
+    local scope
+    local value
+    local marker
+    local temp_file
+
+    record="$(select_managed_rule block "Blocked IP Rules")" || return 0
+    file="$(cut -d'|' -f2 <<< "$record")"
+    line_no="$(cut -d'|' -f3 <<< "$record")"
+    scope="$(cut -d'|' -f4 <<< "$record")"
+    value="$(cut -d'|' -f5 <<< "$record")"
+    marker="$(sed -n "${line_no}p" "$file")"
+
+    confirm "Remove block rule for ${value} from ${scope}?" "no" || return 0
+    temp_file="$(remove_marker_pair_from_file "$file" "$marker")"
+    replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_BLOCK_IP_REMOVE" "$([[ "$scope" != "global" ]] && printf '%s' "$scope")"
+    local result=$?
+    rm -f "$temp_file"
+    return "$result"
 }
 
 cmd_nginx_whitelist_ip() {
@@ -1299,42 +2223,252 @@ cmd_nginx_whitelist_ip() {
     require_debian_based
     ensure_nginx_installed
 
+    local action
     local scope
-    local mode
     local value
-    local domain
-    local rule
+    local mode_choice
+    local mode="trusted"
+
+    action="$(select_option "Whitelist" "Add rule" "List rules" "Edit rule" "Remove rule")"
+    case "$action" in
+        "List rules") cmd_nginx_whitelist_ip_list; return ;;
+        "Edit rule") cmd_nginx_whitelist_ip_edit; return ;;
+        "Remove rule") cmd_nginx_whitelist_ip_remove; return ;;
+    esac
 
     warn_real_ip_if_needed
-    scope="$(select_ip_scope "Whitelist IP:")"
-
+    scope="$(select_scope_for_rule)" || return 1
     while true; do
         value="$(ask_input "IP or CIDR")"
         validate_ip_or_cidr "$value" && break
         warning "Invalid IP/CIDR."
     done
+    mode_choice="$(select_option "Whitelist mode:" "Add trusted IP without blocking others" "Allow only selected IPs and deny everyone else")"
+    [[ "$mode_choice" == "Allow only selected IPs and deny everyone else" ]] && mode="allow-only"
+    add_allow_ip_rule "$scope" "$value" "$mode"
+}
 
-    mode="$(
-        select_option \
-            "Whitelist mode:" \
-            "Add trusted IP without blocking others" \
-            "Allow only selected IPs and deny everyone else"
-    )"
+cmd_nginx_whitelist_ip_list() {
+    require_root
+    require_debian_based
+    ensure_nginx_installed
+    print_rule_records allow "Whitelist Rules" || true
+}
 
-    rule="allow ${value};"
-    if [[ "$mode" == "Allow only selected IPs and deny everyone else" ]]; then
-        warning "This can lock users or services out."
-        confirm "Add deny all after the allow rule?" "no" || return 0
-        rule="${rule}
-deny all;"
+cmd_nginx_whitelist_ip_edit() {
+    require_root
+    require_debian_based
+    ensure_nginx_installed
+
+    local record file line_no scope old_value old_marker new_value new_scope mode_choice mode temp_file
+
+    record="$(select_managed_rule allow "Whitelist Rules")" || return 0
+    file="$(cut -d'|' -f2 <<< "$record")"
+    line_no="$(cut -d'|' -f3 <<< "$record")"
+    scope="$(cut -d'|' -f4 <<< "$record")"
+    old_value="$(cut -d'|' -f5 <<< "$record")"
+    old_marker="$(sed -n "${line_no}p" "$file")"
+
+    echo "Current IP/CIDR: ${old_value}"
+    while true; do
+        new_value="$(ask_input "New IP/CIDR" "$old_value")"
+        validate_ip_or_cidr "$new_value" && break
+        warning "Invalid IP/CIDR."
+    done
+    new_scope="$(select_scope_for_rule "$scope")" || return 1
+    mode_choice="$(select_option "Whitelist mode:" "trusted IP only" "allow-only")"
+    mode="trusted"
+    [[ "$mode_choice" == "allow-only" ]] && mode="allow-only"
+
+    temp_file="$(remove_marker_pair_from_file "$file" "$old_marker")"
+    replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_ALLOW_IP_EDIT" "$([[ "$scope" != "global" ]] && printf '%s' "$scope")" || {
+        rm -f "$temp_file"
+        return 1
+    }
+    rm -f "$temp_file"
+
+    if has_allow_only_for_scope "$scope" && [[ "$(count_allow_rules_for_scope "$scope")" -eq 0 ]]; then
+        warning "Removing hostctl deny-all for ${scope}; no hostctl allow rules remain there."
+        remove_allow_only_for_scope "$scope" || true
+        nginx_test_and_reload "$([[ "$scope" != "global" ]] && printf '%s' "$scope")" || return 1
+    elif [[ "$mode" == "trusted" ]]; then
+        remove_allow_only_for_scope "$scope" || true
+        nginx_test_and_reload "$([[ "$scope" != "global" ]] && printf '%s' "$scope")" || return 1
+    fi
+    add_allow_ip_rule "$new_scope" "$new_value" "$mode"
+}
+
+cmd_nginx_whitelist_ip_remove() {
+    require_root
+    require_debian_based
+    ensure_nginx_installed
+
+    local record file line_no scope value marker temp_file allow_count remove_deny="no"
+
+    record="$(select_managed_rule allow "Whitelist Rules")" || return 0
+    file="$(cut -d'|' -f2 <<< "$record")"
+    line_no="$(cut -d'|' -f3 <<< "$record")"
+    scope="$(cut -d'|' -f4 <<< "$record")"
+    value="$(cut -d'|' -f5 <<< "$record")"
+    marker="$(sed -n "${line_no}p" "$file")"
+
+    if has_allow_only_for_scope "$scope"; then
+        allow_count="$(count_allow_rules_for_scope "$scope")"
+        if [[ "$allow_count" -le 1 ]]; then
+            warning "This is the last allowed IP while deny-all is active."
+            select_option "Choose:" "Remove rule and remove hostctl deny-all" "Cancel" | grep -q '^Remove' || return 0
+            remove_deny="yes"
+        fi
     fi
 
-    if [[ "$scope" == "Globally" ]]; then
-        append_unique_rule_file "$HOSTCTL_NGINX_ALLOWED_IPS_CONF" "$rule" "NGINX_WHITELIST_IP"
-    else
-        domain="$(select_nginx_domain "no")"
-        append_unique_domain_rule "$domain" "$rule" "NGINX_WHITELIST_IP"
+    confirm "Remove whitelist rule for ${value} from ${scope}?" "no" || return 0
+    temp_file="$(remove_marker_pair_from_file "$file" "$marker")"
+    replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_ALLOW_IP_REMOVE" "$([[ "$scope" != "global" ]] && printf '%s' "$scope")" || {
+        rm -f "$temp_file"
+        return 1
+    }
+    rm -f "$temp_file"
+    if [[ "$remove_deny" == "yes" ]]; then
+        remove_allow_only_for_scope "$scope" || true
+        nginx_test_and_reload "$([[ "$scope" != "global" ]] && printf '%s' "$scope")"
     fi
+}
+
+render_rate_zone_file_from_markers() {
+    local output="$1"
+    local records
+    local record
+    local domain
+    local rate
+    local zone
+
+    printf '# Managed by hostctl\n' > "$output"
+    records="$(collect_managed_rules rate)"
+    [[ -z "$records" ]] && return 0
+
+    while IFS= read -r record; do
+        domain="$(cut -d'|' -f4 <<< "$record")"
+        rate="$(cut -d'|' -f6 <<< "$record")"
+        zone="$(rate_zone_name "$domain")"
+        printf '# HOSTCTL:RATE-ZONE:domain=%s:zone=%s:rate=%s\n' "$domain" "$zone" "$rate" >> "$output"
+        printf 'limit_req_zone $binary_remote_addr zone=%s:10m rate=%sr/s;\n' "$zone" "$rate" >> "$output"
+    done <<< "$records"
+}
+
+add_rate_limit_rule() {
+    local domain="$1"
+    local rate="$2"
+    local burst="$3"
+    local target
+    local zone
+    local marker
+    local directive
+    local temp_file
+
+    assert_single_enabled_domain_owner "$domain" || return 1
+    target="$(domain_config_for_rule_scope "$domain")" || return 1
+    zone="$(rate_zone_name "$domain")"
+    marker="# HOSTCTL:RATE-LIMIT:domain=${domain}:rate=${rate}:burst=${burst}"
+    directive="limit_req zone=${zone} burst=${burst} nodelay;"
+
+    insert_managed_block_in_location "$target" "$marker" "$directive" "NGINX_RATE_LIMIT_ADD" "$domain" || return 1
+    temp_file="$(mktemp)"
+    render_rate_zone_file_from_markers "$temp_file"
+    replace_file_from_temp_with_validation "$HOSTCTL_NGINX_RATE_ZONE_CONF" "$temp_file" "NGINX_RATE_LIMIT_ADD" "$domain"
+    local result=$?
+    rm -f "$temp_file"
+    return "$result"
+}
+
+cmd_nginx_rate_limit() {
+    require_root
+    require_debian_based
+    ensure_nginx_installed
+
+    local action
+    local domain
+    local rate_burst
+    local rate
+    local burst
+
+    action="$(select_option "Rate Limiting" "Add rule" "List rules" "Edit rule" "Remove rule")"
+    case "$action" in
+        "List rules") cmd_nginx_rate_limit_list; return ;;
+        "Edit rule") cmd_nginx_rate_limit_edit; return ;;
+        "Remove rule") cmd_nginx_rate_limit_remove; return ;;
+    esac
+
+    domain="$(select_nginx_domain "no")"
+    assert_single_enabled_domain_owner "$domain" || return 1
+    rate_burst="$(select_rate_profile)"
+    rate="${rate_burst%%|*}"
+    burst="${rate_burst##*|}"
+    add_rate_limit_rule "$domain" "$rate" "$burst"
+}
+
+cmd_nginx_rate_limit_list() {
+    require_root
+    require_debian_based
+    ensure_nginx_installed
+    print_rule_records rate "Rate Limits" || true
+}
+
+cmd_nginx_rate_limit_edit() {
+    require_root
+    require_debian_based
+    ensure_nginx_installed
+
+    local record file line_no domain old_marker rate_burst rate burst temp_file
+
+    record="$(select_managed_rule rate "Rate Limits")" || return 0
+    file="$(cut -d'|' -f2 <<< "$record")"
+    line_no="$(cut -d'|' -f3 <<< "$record")"
+    domain="$(cut -d'|' -f4 <<< "$record")"
+    old_marker="$(sed -n "${line_no}p" "$file")"
+
+    echo "Domain: ${domain}"
+    echo "Rate: $(cut -d'|' -f6 <<< "$record") req/s"
+    echo "Burst: $(cut -d'|' -f7 <<< "$record")"
+    rate_burst="$(select_rate_profile)"
+    rate="${rate_burst%%|*}"
+    burst="${rate_burst##*|}"
+
+    temp_file="$(remove_marker_pair_from_file "$file" "$old_marker")"
+    replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_RATE_LIMIT_EDIT" "$domain" || {
+        rm -f "$temp_file"
+        return 1
+    }
+    rm -f "$temp_file"
+    add_rate_limit_rule "$domain" "$rate" "$burst"
+}
+
+cmd_nginx_rate_limit_remove() {
+    require_root
+    require_debian_based
+    ensure_nginx_installed
+
+    local record file line_no domain old_marker temp_file zone_file
+
+    record="$(select_managed_rule rate "Rate Limits")" || return 0
+    file="$(cut -d'|' -f2 <<< "$record")"
+    line_no="$(cut -d'|' -f3 <<< "$record")"
+    domain="$(cut -d'|' -f4 <<< "$record")"
+    old_marker="$(sed -n "${line_no}p" "$file")"
+
+    confirm "Remove rate limit for ${domain}?" "no" || return 0
+    temp_file="$(remove_marker_pair_from_file "$file" "$old_marker")"
+    replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_RATE_LIMIT_REMOVE" "$domain" || {
+        rm -f "$temp_file"
+        return 1
+    }
+    rm -f "$temp_file"
+
+    zone_file="$(mktemp)"
+    render_rate_zone_file_from_markers "$zone_file"
+    replace_file_from_temp_with_validation "$HOSTCTL_NGINX_RATE_ZONE_CONF" "$zone_file" "NGINX_RATE_LIMIT_REMOVE" "$domain"
+    local result=$?
+    rm -f "$zone_file"
+    return "$result"
 }
 
 # ---------------------------------------------------------

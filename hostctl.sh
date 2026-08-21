@@ -98,8 +98,17 @@ Nginx / SSL:
   --domain                 Configure reverse proxy domain
   --nginx-security         Configure Nginx security
   --nginx-rate-limit       Configure rate limiting
+  --nginx-rate-limit-list  List rate limits
+  --nginx-rate-limit-edit  Edit rate limit
+  --nginx-rate-limit-remove Remove rate limit
   --nginx-block-ip         Block IP/CIDR
+  --nginx-block-ip-list    List blocked IP rules
+  --nginx-block-ip-edit    Edit blocked IP rule
+  --nginx-block-ip-remove  Remove blocked IP rule
   --nginx-whitelist-ip     Whitelist IP/CIDR
+  --nginx-whitelist-ip-list List whitelist rules
+  --nginx-whitelist-ip-edit Edit whitelist rule
+  --nginx-whitelist-ip-remove Remove whitelist rule
   --nginx-logs             Show Nginx logs
   --nginx-logs-clear       Clear/rotate Nginx logs
   --ssl                    Configure Certbot SSL
@@ -293,12 +302,48 @@ case "$COMMAND" in
         cmd_nginx_rate_limit "$@"
         ;;
 
+    --nginx-rate-limit-list)
+        cmd_nginx_rate_limit_list "$@"
+        ;;
+
+    --nginx-rate-limit-edit)
+        cmd_nginx_rate_limit_edit "$@"
+        ;;
+
+    --nginx-rate-limit-remove)
+        cmd_nginx_rate_limit_remove "$@"
+        ;;
+
     --nginx-block-ip)
         cmd_nginx_block_ip "$@"
         ;;
 
+    --nginx-block-ip-list)
+        cmd_nginx_block_ip_list "$@"
+        ;;
+
+    --nginx-block-ip-edit)
+        cmd_nginx_block_ip_edit "$@"
+        ;;
+
+    --nginx-block-ip-remove)
+        cmd_nginx_block_ip_remove "$@"
+        ;;
+
     --nginx-whitelist-ip)
         cmd_nginx_whitelist_ip "$@"
+        ;;
+
+    --nginx-whitelist-ip-list)
+        cmd_nginx_whitelist_ip_list "$@"
+        ;;
+
+    --nginx-whitelist-ip-edit)
+        cmd_nginx_whitelist_ip_edit "$@"
+        ;;
+
+    --nginx-whitelist-ip-remove)
+        cmd_nginx_whitelist_ip_remove "$@"
         ;;
 
     --nginx-logs)
