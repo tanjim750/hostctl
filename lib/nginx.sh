@@ -50,6 +50,18 @@ nginx_debug() {
     fi
 }
 
+first_nonempty_line() {
+    local line
+
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        printf '%s\n' "$line"
+        return 0
+    done
+
+    return 1
+}
+
 ensure_nginx_layout() {
     [[ -f "$NGINX_CONF" ]] || die "Missing Nginx config: $NGINX_CONF"
     [[ -d "$NGINX_CONF_D" ]] || die "Missing Nginx conf.d directory: $NGINX_CONF_D"
@@ -341,21 +353,25 @@ extract_domains_from_config_dir() {
     local dir="$1"
     local file
     local resolved
+    local files=()
 
     [[ -d "$dir" ]] || return 0
 
-    find "$dir" -maxdepth 1 \( -type f -o -type l \) -print |
-        while IFS= read -r file; do
-            is_ignored_nginx_config_path "$file" && continue
-            if [[ -L "$file" ]]; then
-                resolved="$(real_config_path "$file" 2>/dev/null || true)"
-                [[ -n "$resolved" && -f "$resolved" ]] || continue
-                is_ignored_nginx_config_path "$resolved" && continue
-                extract_server_names_from_file "$resolved"
-            elif [[ -f "$file" ]]; then
-                extract_server_names_from_file "$file"
-            fi
-        done
+    while IFS= read -r file; do
+        files+=("$file")
+    done < <(find "$dir" -maxdepth 1 \( -type f -o -type l \) -print)
+
+    for file in "${files[@]}"; do
+        is_ignored_nginx_config_path "$file" && continue
+        if [[ -L "$file" ]]; then
+            resolved="$(real_config_path "$file" 2>/dev/null || true)"
+            [[ -n "$resolved" && -f "$resolved" ]] || continue
+            is_ignored_nginx_config_path "$resolved" && continue
+            extract_server_names_from_file "$resolved"
+        elif [[ -f "$file" ]]; then
+            extract_server_names_from_file "$file"
+        fi
+    done
 }
 
 select_nginx_domain() {
@@ -466,27 +482,30 @@ find_enabled_domain_owner() {
     local ignore_real=""
     local enabled
     local resolved
+    local enabled_files=()
 
     [[ -d "$NGINX_SITES_ENABLED" ]] || return 1
     [[ -n "$ignore_path" ]] && ignore_real="$(real_config_path "$ignore_path" 2>/dev/null || true)"
 
-    find "$NGINX_SITES_ENABLED" -maxdepth 1 \( -type f -o -type l \) -print |
-        while IFS= read -r enabled; do
-            is_ignored_nginx_config_path "$enabled" && continue
-            resolved="$(real_config_path "$enabled" 2>/dev/null || true)"
-            [[ -n "$resolved" && -f "$resolved" ]] || continue
-            is_ignored_nginx_config_path "$resolved" && continue
+    while IFS= read -r enabled; do
+        enabled_files+=("$enabled")
+    done < <(find "$NGINX_SITES_ENABLED" -maxdepth 1 \( -type f -o -type l \) -print)
 
-            if [[ -n "$ignore_path" ]] &&
-               { [[ "$enabled" == "$ignore_path" ]] || [[ "$resolved" == "$ignore_path" ]] || [[ -n "$ignore_real" && "$resolved" == "$ignore_real" ]]; }; then
-                continue
-            fi
+    for enabled in "${enabled_files[@]}"; do
+        is_ignored_nginx_config_path "$enabled" && continue
+        resolved="$(real_config_path "$enabled" 2>/dev/null || true)"
+        [[ -n "$resolved" && -f "$resolved" ]] || continue
+        is_ignored_nginx_config_path "$resolved" && continue
 
-            if config_declares_domain "$resolved" "$domain"; then
-                printf '%s|%s\n' "$enabled" "$resolved"
-                return 0
-            fi
-        done
+        if [[ -n "$ignore_path" ]] &&
+           { [[ "$enabled" == "$ignore_path" ]] || [[ "$resolved" == "$ignore_path" ]] || [[ -n "$ignore_real" && "$resolved" == "$ignore_real" ]]; }; then
+            continue
+        fi
+
+        if config_declares_domain "$resolved" "$domain"; then
+            printf '%s|%s\n' "$enabled" "$resolved"
+        fi
+    done
 }
 
 expand_nginx_include_pattern() {
@@ -510,14 +529,19 @@ expand_nginx_include_pattern() {
 
 nginx_included_config_paths() {
     local include_path
+    local path
 
     {
         if [[ -d "$NGINX_SITES_ENABLED" ]]; then
-            find "$NGINX_SITES_ENABLED" -maxdepth 1 \( -type f -o -type l \) -print
+            while IFS= read -r path; do
+                printf '%s\n' "$path"
+            done < <(find "$NGINX_SITES_ENABLED" -maxdepth 1 \( -type f -o -type l \) -print)
         fi
 
         if [[ -d "$NGINX_CONF_D" ]]; then
-            find "$NGINX_CONF_D" -maxdepth 1 -type f -name '*.conf' -print
+            while IFS= read -r path; do
+                printf '%s\n' "$path"
+            done < <(find "$NGINX_CONF_D" -maxdepth 1 -type f -name '*.conf' -print)
         fi
 
         if [[ -f "$NGINX_CONF" ]]; then
@@ -642,10 +666,14 @@ domain_source_config_paths() {
 
     {
         if [[ -d "$NGINX_SITES_AVAILABLE" ]]; then
-            find "$NGINX_SITES_AVAILABLE" -maxdepth 1 -type f -print
+            while IFS= read -r file; do
+                printf '%s\n' "$file"
+            done < <(find "$NGINX_SITES_AVAILABLE" -maxdepth 1 -type f -print)
         fi
         if [[ -d "$NGINX_CONF_D" ]]; then
-            find "$NGINX_CONF_D" -maxdepth 1 -type f -name '*.conf.disabled' -print
+            while IFS= read -r file; do
+                printf '%s\n' "$file"
+            done < <(find "$NGINX_CONF_D" -maxdepth 1 -type f -name '*.conf.disabled' -print)
         fi
     } |
         while IFS= read -r file; do
@@ -700,7 +728,7 @@ preferred_domain_source_config() {
         return 0
     fi
 
-    domain_source_config_paths "$domain" | head -n 1
+    domain_source_config_paths "$domain" | first_nonempty_line
 }
 
 resolve_domain_deployment_target() {
@@ -721,7 +749,7 @@ resolve_domain_deployment_target() {
     DOMAIN_CONFLICT_LINK_TARGET=""
     DOMAIN_CONFLICT_BACKUP=""
 
-    conflict="$(find_enabled_domain_owner "$domain" "$default_target" | head -n 1 || true)"
+    conflict="$(find_enabled_domain_owner "$domain" "$default_target" | first_nonempty_line || true)"
     [[ -z "$conflict" ]] && return 0
 
     conflict_link="${conflict%%|*}"
@@ -1254,7 +1282,7 @@ restore_domain_previous_state() {
             return 1
         fi
 
-        conflict="$(find_enabled_domain_owner "$domain" "$target" | head -n 1 || true)"
+        conflict="$(find_enabled_domain_owner "$domain" "$target" | first_nonempty_line || true)"
         if [[ -n "$conflict" && "${conflict%%|*}" != "$symlink" ]]; then
             error "Domain ${domain} is already active in: ${conflict%%|*}"
             error "Resolve the duplicate server_name before restoring saved state."
@@ -1347,7 +1375,7 @@ enable_domain() {
         die "No disabled source config found for ${domain}."
     fi
 
-    conflict="$(find_enabled_domain_owner "$domain" "$source" | head -n 1 || true)"
+    conflict="$(find_enabled_domain_owner "$domain" "$source" | first_nonempty_line || true)"
     if [[ -n "$conflict" ]]; then
         error "Domain ${domain} is already active in: ${conflict%%|*}"
         error "Resolve the duplicate server_name before enabling this config."
@@ -1777,6 +1805,7 @@ cmd_nginx_security() {
 
     local action
     local temp_file
+    local backup=""
     local include_bots="yes"
 
     action="$(
@@ -1809,14 +1838,29 @@ cmd_nginx_security() {
     nginx_conf_includes_conf_d || warning "Could not verify that /etc/nginx/conf.d/*.conf is included from nginx.conf."
     temp_file="$(mktemp)"
     render_security_config "$temp_file" "$include_bots"
-    write_managed_file_with_rollback "$HOSTCTL_NGINX_SECURITY_CONF" "$temp_file" "NGINX_SECURITY" || {
-        local result=$?
-        rm -f "$temp_file"
-        return "$result"
-    }
+    [[ -f "$HOSTCTL_NGINX_SECURITY_CONF" ]] && backup="$(backup_file "$HOSTCTL_NGINX_SECURITY_CONF" || true)"
+    cp "$temp_file" "$HOSTCTL_NGINX_SECURITY_CONF" || return 1
     rm -f "$temp_file"
     ensure_domain_snippet
-    nginx_test_and_reload
+    ensure_security_enforcement_includes || {
+        restore_file_backup "$backup" "$HOSTCTL_NGINX_SECURITY_CONF"
+        validate_nginx_config || true
+        restart_nginx || true
+        return 1
+    }
+
+    if nginx_test_and_reload; then
+        verify_security_enforcement || return 1
+        log_event "NGINX_SECURITY result=success target=${HOSTCTL_NGINX_SECURITY_CONF}"
+        success "Nginx security rules applied and active."
+        return 0
+    fi
+
+    restore_file_backup "$backup" "$HOSTCTL_NGINX_SECURITY_CONF"
+    validate_nginx_config || true
+    restart_nginx || true
+    log_event "NGINX_SECURITY result=failed target=${HOSTCTL_NGINX_SECURITY_CONF}"
+    return 1
 }
 
 remove_managed_nginx_file() {
@@ -1931,15 +1975,16 @@ managed_rule_files() {
     printf '%s\n' "$HOSTCTL_NGINX_GLOBAL_ACCESS_SNIPPET"
 
     if [[ -d "$NGINX_SNIPPETS" ]]; then
-        find "$NGINX_SNIPPETS" -maxdepth 1 -type f -name 'hostctl-access-*.conf' -print
+        while IFS= read -r file; do
+            printf '%s\n' "$file"
+        done < <(find "$NGINX_SNIPPETS" -maxdepth 1 -type f -name 'hostctl-access-*.conf' -print)
     fi
 
     if [[ -d "$NGINX_SITES_AVAILABLE" ]]; then
-        find "$NGINX_SITES_AVAILABLE" -maxdepth 1 -type f -print |
-            while IFS= read -r file; do
-                is_ignored_nginx_config_path "$file" && continue
-                printf '%s\n' "$file"
-            done
+        while IFS= read -r file; do
+            is_ignored_nginx_config_path "$file" && continue
+            printf '%s\n' "$file"
+        done < <(find "$NGINX_SITES_AVAILABLE" -maxdepth 1 -type f -print)
     fi
 }
 
@@ -2020,8 +2065,8 @@ find_managed_rule_block() {
     local begin_line
     local end_line
 
-    begin_line="$(grep -nF "# HOSTCTL:${type}:BEGIN id=${id}" "$file" | head -n 1 | cut -d: -f1 || true)"
-    end_line="$(grep -nF "# HOSTCTL:${type}:END id=${id}" "$file" | head -n 1 | cut -d: -f1 || true)"
+    begin_line="$(grep -nF "# HOSTCTL:${type}:BEGIN id=${id}" "$file" | first_nonempty_line | cut -d: -f1 || true)"
+    end_line="$(grep -nF "# HOSTCTL:${type}:END id=${id}" "$file" | first_nonempty_line | cut -d: -f1 || true)"
 
     if [[ -z "$begin_line" || -z "$end_line" || ! "$begin_line" =~ ^[0-9]+$ || ! "$end_line" =~ ^[0-9]+$ || "$end_line" -le "$begin_line" ]]; then
         error "Managed rule block is incomplete or missing."
@@ -2149,7 +2194,7 @@ collect_managed_rules() {
         [[ -f "$file" ]] || continue
         scope="global"
         if [[ "$file" != "$HOSTCTL_NGINX_BLOCKED_IPS_CONF" && "$file" != "$HOSTCTL_NGINX_ALLOWED_IPS_CONF" && "$file" != "$HOSTCTL_NGINX_RATE_ZONE_CONF" ]]; then
-            scope="$(extract_server_names_from_file "$file" | head -n 1 || true)"
+            scope="$(extract_server_names_from_file "$file" | first_nonempty_line || true)"
             [[ -n "$scope" ]] || scope="unknown"
         fi
 
@@ -2324,7 +2369,7 @@ domain_config_for_rule_scope() {
         return 1
     fi
 
-    owner="$(find_enabled_domain_owner "$scope" | head -n 1 || true)"
+    owner="$(find_enabled_domain_owner "$scope" | first_nonempty_line || true)"
     if [[ -n "$owner" ]]; then
         printf '%s\n' "${owner#*|}"
     else
@@ -2352,9 +2397,11 @@ ensure_location_include() {
     local target="$1"
     local include_path="$2"
     local domain="${3:-}"
+    local restart_now="${4:-yes}"
     local backup=""
     local temp_file
     local awk_status=0
+    local action
 
     [[ -f "$target" ]] || return 1
     if grep -Fq "include ${include_path};" "$target"; then
@@ -2362,12 +2409,29 @@ ensure_location_include() {
     fi
 
     if ! grep -q 'Managed by hostctl' "$target"; then
-        warning "This configuration was not created by hostctl: ${target}"
-        warning "hostctl needs to insert an access-rule include before the rule can be effective."
-        if ! confirm "Continue?" "no"; then
-            warning "Access rule update cancelled."
-            return 1
-        fi
+        echo
+        warning "This configuration was not created by hostctl:"
+        printf '%s\n' "$target" >&2
+        echo >&2
+        action="$(
+            select_option \
+                "Modify non-hostctl config:" \
+                "Backup and allow hostctl to modify it" \
+                "Skip this configuration" \
+                "Cancel"
+        )"
+
+        case "$action" in
+            "Backup and allow hostctl to modify it") ;;
+            "Skip this configuration")
+                warning "Skipped non-hostctl configuration: ${target}"
+                return 0
+                ;;
+            "Cancel")
+                warning "Access rule update cancelled."
+                return 1
+                ;;
+        esac
     fi
 
     backup="$(backup_file "$target" || true)"
@@ -2376,7 +2440,17 @@ ensure_location_include() {
         BEGIN { inserted = 0 }
         /location[[:space:]]+\/[[:space:]]*\{/ && inserted == 0 {
             print;
-            print "        include " include_path ";";
+            if (include_path ~ /hostctl-global-access\.conf$/) {
+                print "        # HOSTCTL:GLOBAL-ACCESS:BEGIN";
+                print "        include " include_path ";";
+                print "        # HOSTCTL:GLOBAL-ACCESS:END";
+            } else if (include_path ~ /hostctl-access-/) {
+                print "        # HOSTCTL:DOMAIN-ACCESS:BEGIN";
+                print "        include " include_path ";";
+                print "        # HOSTCTL:DOMAIN-ACCESS:END";
+            } else {
+                print "        include " include_path ";";
+            }
             inserted = 1;
             next;
         }
@@ -2403,6 +2477,10 @@ ensure_location_include() {
     }
     rm -f "$temp_file"
 
+    if [[ "$restart_now" != "yes" ]]; then
+        return 0
+    fi
+
     if nginx_test_and_reload "$domain"; then
         return 0
     fi
@@ -2421,8 +2499,47 @@ ensure_domain_access_includes() {
     target="$(domain_config_for_rule_scope "$domain")" || return 1
     ensure_global_access_snippet
     ensure_domain_access_snippet "$domain"
-    ensure_location_include "$target" "$HOSTCTL_NGINX_GLOBAL_ACCESS_SNIPPET" "$domain" || return 1
-    ensure_location_include "$target" "$(domain_access_snippet "$domain")" "$domain" || return 1
+    ensure_location_include "$target" "$HOSTCTL_NGINX_GLOBAL_ACCESS_SNIPPET" "$domain" "no" || return 1
+    ensure_location_include "$target" "$(domain_access_snippet "$domain")" "$domain" "no" || return 1
+}
+
+ensure_security_enforcement_includes() {
+    local domain
+    local domains
+    local target
+
+    domains="$(detect_nginx_domains || true)"
+    [[ -z "$domains" ]] && return 0
+
+    while IFS= read -r domain; do
+        [[ -n "$domain" ]] || continue
+        domain_is_active "$domain" || continue
+        target="$(domain_config_for_rule_scope "$domain")" || return 1
+        ensure_location_include "$target" "$HOSTCTL_NGINX_DOMAIN_SNIPPET" "$domain" "no" || return 1
+    done <<< "$domains"
+}
+
+verify_security_enforcement() {
+    local domain
+    local domains
+    local active_count=0
+
+    domains="$(detect_nginx_domains || true)"
+    while IFS= read -r domain; do
+        [[ -n "$domain" ]] || continue
+        domain_is_active "$domain" || continue
+        active_count=$((active_count + 1))
+        if ! active_domain_includes_snippet "$domain" "$HOSTCTL_NGINX_DOMAIN_SNIPPET"; then
+            error "Security maps were written but active domain does not include enforcement snippet: ${domain}"
+            return 1
+        fi
+    done <<< "$domains"
+
+    if [[ "$active_count" -eq 0 ]]; then
+        warning "No active Nginx domains found for security enforcement verification."
+    fi
+
+    return 0
 }
 
 ensure_global_access_includes() {
