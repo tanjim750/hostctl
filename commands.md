@@ -24,6 +24,10 @@ hostctl --nginx-security
 hostctl --nginx-rate-limit
 hostctl --nginx-block-ip
 hostctl --nginx-whitelist-ip
+sudo hostctl --nginx-block-ip-list
+sudo hostctl --nginx-block-ip-remove
+sudo hostctl --nginx-whitelist-ip-list
+sudo hostctl --nginx-rate-limit-list
 hostctl --nginx-logs
 hostctl --nginx-logs-clear
 

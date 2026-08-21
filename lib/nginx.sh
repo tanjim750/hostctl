@@ -16,6 +16,7 @@ HOSTCTL_NGINX_RATE_ZONE_CONF="${NGINX_CONF_D}/hostctl-rate-limit.conf"
 HOSTCTL_NGINX_BLOCKED_IPS_CONF="${NGINX_CONF_D}/hostctl-blocked-ips.conf"
 HOSTCTL_NGINX_ALLOWED_IPS_CONF="${NGINX_CONF_D}/hostctl-allowed-ips.conf"
 HOSTCTL_NGINX_DOMAIN_SNIPPET="${NGINX_SNIPPETS}/hostctl-domain-access.conf"
+HOSTCTL_NGINX_STATE_DIR="${HOSTCTL_STATE_DIR}/nginx"
 
 DOMAIN_TARGET_PATH=""
 DOMAIN_ENABLED_PATH=""
@@ -23,6 +24,16 @@ DOMAIN_CONFLICT_LINK_TO_DISABLE=""
 DOMAIN_CONFLICT_LINK_TARGET=""
 DOMAIN_CONFLICT_BACKUP=""
 NGINX_LAST_TEST_OUTPUT=""
+RULE_TYPE=""
+RULE_SCOPE=""
+RULE_VALUE=""
+RULE_FILE=""
+RULE_ID=""
+RULE_LINE=""
+RULE_RATE=""
+RULE_BURST=""
+RULE_ZONE=""
+RULE_MODE=""
 
 # ---------------------------------------------------------
 # Common helpers
@@ -462,11 +473,14 @@ find_enabled_domain_owner() {
 expand_nginx_include_pattern() {
     local pattern="$1"
     local file
+    local matches
 
     [[ "$pattern" == /* ]] || return 0
 
     if [[ "$pattern" == *"*"* || "$pattern" == *"?"* || "$pattern" == *"["* ]]; then
-        compgen -G "$pattern" |
+        matches="$(compgen -G "$pattern" || true)"
+        [[ -z "$matches" ]] && return 0
+        printf '%s\n' "$matches" |
             while IFS= read -r file; do
                 [[ -f "$file" || -L "$file" ]] && printf '%s\n' "$file"
             done
@@ -1114,11 +1128,175 @@ inspect_domain_config() {
     fi
 }
 
+domain_state_file() {
+    local domain="$1"
+
+    printf '%s/%s.state\n' "$HOSTCTL_NGINX_STATE_DIR" "$domain"
+}
+
+persist_domain_disable_state() {
+    local domain="$1"
+    local http_active="$2"
+    local https_active="$3"
+    local state_file
+    local pair
+    local index=0
+
+    [[ "${#removed_links[@]}" -gt 0 ]] || return 0
+    mkdir -p "$HOSTCTL_NGINX_STATE_DIR"
+    state_file="$(domain_state_file "$domain")"
+
+    {
+        printf 'DOMAIN=%q\n' "$domain"
+        printf 'TIMESTAMP=%q\n' "$(date +%Y%m%d%H%M%S)"
+        [[ "$http_active" == "yes" ]] && printf 'HTTP_ACTIVE=1\n' || printf 'HTTP_ACTIVE=0\n'
+        [[ "$https_active" == "yes" ]] && printf 'HTTPS_ACTIVE=1\n' || printf 'HTTPS_ACTIVE=0\n'
+        for pair in "${removed_links[@]}"; do
+            index=$((index + 1))
+            printf 'SYMLINK_%d=%q\n' "$index" "${pair%%|*}"
+            printf 'TARGET_%d=%q\n' "$index" "${pair#*|}"
+        done
+        printf 'SYMLINK_COUNT=%d\n' "$index"
+    } > "$state_file"
+}
+
+saved_domain_state_exists() {
+    local domain="$1"
+    local state_file
+
+    state_file="$(domain_state_file "$domain")"
+    [[ -f "$state_file" ]]
+}
+
+restore_domain_previous_state() {
+    local domain="$1"
+    local state_file
+    local expected_http=0
+    local expected_https=0
+    local count=0
+    local index
+    local symlink_var
+    local target_var
+    local symlink
+    local target
+    local conflict
+    local restored_links=()
+
+    state_file="$(domain_state_file "$domain")"
+    if [[ ! -f "$state_file" ]]; then
+        return 1
+    fi
+
+    # shellcheck disable=SC1090
+    source "$state_file"
+    expected_http="${HTTP_ACTIVE:-0}"
+    expected_https="${HTTPS_ACTIVE:-0}"
+    count="${SYMLINK_COUNT:-0}"
+
+    if [[ "$count" -le 0 ]]; then
+        error "Saved state for ${domain} does not contain any symlinks."
+        return 1
+    fi
+
+    for ((index = 1; index <= count; index++)); do
+        symlink_var="SYMLINK_${index}"
+        target_var="TARGET_${index}"
+        symlink="${!symlink_var:-}"
+        target="${!target_var:-}"
+
+        if [[ -z "$symlink" || -z "$target" ]]; then
+            error "Saved state for ${domain} is incomplete at symlink ${index}."
+            return 1
+        fi
+        if [[ ! -f "$target" ]]; then
+            error "Cannot restore missing target: ${target}"
+            return 1
+        fi
+
+        conflict="$(find_enabled_domain_owner "$domain" "$target" | head -n 1 || true)"
+        if [[ -n "$conflict" && "${conflict%%|*}" != "$symlink" ]]; then
+            error "Domain ${domain} is already active in: ${conflict%%|*}"
+            error "Resolve the duplicate server_name before restoring saved state."
+            return 1
+        fi
+    done
+
+    for ((index = 1; index <= count; index++)); do
+        symlink_var="SYMLINK_${index}"
+        target_var="TARGET_${index}"
+        symlink="${!symlink_var:-}"
+        target="${!target_var:-}"
+        info "Restoring enabled symlink: ${symlink} -> ${target}"
+        ln -sfn "$target" "$symlink" || {
+            error "Failed to restore symlink: ${symlink}"
+            rollback_restored_domain_links
+            return 1
+        }
+        restored_links+=("$symlink")
+    done
+
+    if ! nginx_test_and_reload "$domain"; then
+        warning "Restored Nginx state failed validation; rolling back."
+        rollback_restored_domain_links
+        validate_nginx_config || true
+        log_event "NGINX_DOMAIN_ENABLE domain=${domain} mode=restore result=failed"
+        return 1
+    fi
+
+    if [[ "$expected_http" -eq 1 ]] && ! domain_has_http_active "$domain"; then
+        error "Restored state did not reactivate HTTP for ${domain}."
+        rollback_restored_domain_links
+        validate_nginx_config || true
+        return 1
+    fi
+    if [[ "$expected_https" -eq 1 ]] && ! domain_has_https_active "$domain"; then
+        error "Restored state did not reactivate HTTPS for ${domain}."
+        rollback_restored_domain_links
+        validate_nginx_config || true
+        return 1
+    fi
+
+    log_event "NGINX_DOMAIN_ENABLE domain=${domain} mode=restore result=success state=${state_file}"
+    success "Domain enabled: ${domain}"
+    return 0
+}
+
+rollback_restored_domain_links() {
+    local symlink
+
+    for symlink in "${restored_links[@]}"; do
+        info "Removing restored symlink: ${symlink}"
+        rm -f "$symlink"
+    done
+}
+
 enable_domain() {
     local domain="$1"
     local source
     local enabled
     local conflict
+    local mode
+
+    if saved_domain_state_exists "$domain"; then
+        mode="$(
+            select_option \
+                "Enable mode:" \
+                "Restore previous active configuration" \
+                "Enable another available configuration" \
+                "Cancel"
+        )"
+
+        case "$mode" in
+            "Restore previous active configuration")
+                restore_domain_previous_state "$domain"
+                return
+                ;;
+            "Cancel")
+                warning "Enable cancelled."
+                return 0
+                ;;
+        esac
+    fi
 
     source="$(preferred_domain_source_config "$domain")"
     if [[ -z "$source" || ! -f "$source" ]]; then
@@ -1335,6 +1513,7 @@ disable_domain_active_configs() {
         fi
     fi
 
+    persist_domain_disable_state "$domain" "$http_active" "$https_active"
     log_event "NGINX_DOMAIN_DISABLE domain=${domain} result=success"
     success "Domain disabled: ${domain}"
     return 0
@@ -1680,7 +1859,7 @@ marker_field() {
     local marker="$1"
     local key="$2"
 
-    tr ':' '\n' <<< "$marker" |
+    tr ': ' '\n\n' <<< "$marker" |
         awk -F= -v key="$key" '$1 == key { print substr($0, length(key) + 2); exit }'
 }
 
@@ -1707,11 +1886,132 @@ rule_record_matches_kind() {
 
     case "$kind" in
         block) [[ "$marker" == "# HOSTCTL:BLOCK-IP:"* ]] ;;
-        allow) [[ "$marker" == "# HOSTCTL:ALLOW-IP:"* ]] ;;
+        allow) [[ "$marker" == "# HOSTCTL:ALLOW-IP:"* || "$marker" == "# HOSTCTL:ALLOW-ONLY:"* ]] ;;
         rate) [[ "$marker" == "# HOSTCTL:RATE-LIMIT:"* ]] ;;
         zone) [[ "$marker" == "# HOSTCTL:RATE-ZONE:"* ]] ;;
         allow-only) [[ "$marker" == "# HOSTCTL:ALLOW-ONLY:"* ]] ;;
     esac
+}
+
+rule_id() {
+    local prefix="$1"
+    local value="$2"
+
+    printf '%s_%s_%s\n' "$prefix" "$(date +%Y%m%d%H%M%S)" "$value" | tr './:' '___' | tr -cd 'A-Za-z0-9_'
+}
+
+rule_kind_from_marker() {
+    local marker="$1"
+
+    case "$marker" in
+        "# HOSTCTL:BLOCK-IP:"*) printf 'block\n' ;;
+        "# HOSTCTL:ALLOW-IP:"*) printf 'allow\n' ;;
+        "# HOSTCTL:ALLOW-ONLY:"*) printf 'allow\n' ;;
+        "# HOSTCTL:RATE-LIMIT:"*) printf 'rate\n' ;;
+        "# HOSTCTL:RATE-ZONE:"*) printf 'zone\n' ;;
+    esac
+}
+
+rule_value_from_directive() {
+    local kind="$1"
+    local directive="$2"
+    local value=""
+
+    case "$kind" in
+        block)
+            value="$(awk '$1 == "deny" && $2 != "all;" { gsub(/;/, "", $2); print $2; exit }' <<< "$directive")"
+            ;;
+        allow)
+            value="$(awk '$1 == "allow" { gsub(/;/, "", $2); print $2; exit }' <<< "$directive")"
+            ;;
+        rate)
+            value="$(awk '
+                $1 == "limit_req" {
+                    for (i = 1; i <= NF; i++) {
+                        if ($i ~ /^zone=/) {
+                            sub(/^zone=/, "", $i);
+                            gsub(/;/, "", $i);
+                            print $i;
+                            exit
+                        }
+                    }
+                }
+            ' <<< "$directive")"
+            ;;
+    esac
+
+    printf '%s\n' "$value"
+}
+
+rule_record_from_marker() {
+    local kind="$1"
+    local file="$2"
+    local line_no="$3"
+    local marker="$4"
+    local directive="$5"
+    local actual_kind
+    local scope
+    local value
+    local rate
+    local burst
+    local zone
+    local id
+    local mode="trusted only"
+
+    actual_kind="$(rule_kind_from_marker "$marker")"
+    [[ "$actual_kind" == "$kind" ]] || return 1
+
+    scope="$(marker_scope "$marker")"
+    value="$(marker_field "$marker" value)"
+    rate="$(marker_field "$marker" rate)"
+    burst="$(marker_field "$marker" burst)"
+    zone="$(marker_field "$marker" zone)"
+    id="$(marker_field "$marker" id)"
+    [[ -n "$id" ]] || id="line_${line_no}"
+
+    [[ -n "$value" ]] || value="$(rule_value_from_directive "$kind" "$directive")"
+    if [[ "$kind" == "rate" && -z "$zone" ]]; then
+        zone="$(rule_value_from_directive "$kind" "$directive")"
+    fi
+    if [[ "$kind" == "allow" ]] && [[ "$marker" == "# HOSTCTL:ALLOW-ONLY:"* ]]; then
+        mode="allow-only"
+    elif [[ "$kind" == "allow" ]] && has_allow_only_for_scope "$scope"; then
+        mode="allow-only"
+    fi
+
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$kind" "$scope" "$value" "$file" "$id" "$line_no" "$rate" "$burst" "$zone" "$mode"
+}
+
+collect_legacy_managed_rules_from_file() {
+    local kind="$1"
+    local file="$2"
+    local scope="$3"
+
+    awk -v kind="$kind" -v file="$file" -v scope="$scope" '
+        function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+        function emit(line_no, value, rate, burst, zone, mode) {
+            printf "%s|%s|%s|%s|legacy_%d|%d|%s|%s|%s|%s\n", kind, scope, value, file, line_no, line_no, rate, burst, zone, mode
+        }
+        {
+            current = trim($0)
+            if (previous == "# Managed by hostctl") {
+                if (kind == "block" && current ~ /^deny[[:space:]]+/ && current !~ /^deny[[:space:]]+all;/) {
+                    value = current; sub(/^deny[[:space:]]+/, "", value); gsub(/;/, "", value); emit(NR - 1, value, "", "", "", "trusted only")
+                } else if (kind == "allow" && current ~ /^allow[[:space:]]+/) {
+                    value = current; sub(/^allow[[:space:]]+/, "", value); gsub(/;/, "", value); emit(NR - 1, value, "", "", "", "trusted only")
+                } else if (kind == "rate" && current ~ /^limit_req[[:space:]]+/) {
+                    zone = ""; burst = "";
+                    n = split(current, parts, /[[:space:]]+/);
+                    for (i = 1; i <= n; i++) {
+                        if (parts[i] ~ /^zone=/) { zone = parts[i]; sub(/^zone=/, "", zone); gsub(/;/, "", zone) }
+                        if (parts[i] ~ /^burst=/) { burst = parts[i]; sub(/^burst=/, "", burst); gsub(/;/, "", burst) }
+                    }
+                    emit(NR - 1, zone, "", burst, zone, "trusted only")
+                }
+            }
+            previous = current
+        }
+    ' "$file"
 }
 
 collect_managed_rules() {
@@ -1719,33 +2019,77 @@ collect_managed_rules() {
     local file
     local line_no
     local line
+    local trimmed
+    local marker
+    local directive
+    local marker_line
+    local actual_kind
     local scope
-    local value
-    local rate
-    local burst
-    local zone
-    local mode
 
     while IFS= read -r file; do
         [[ -f "$file" ]] || continue
+        scope="global"
+        if [[ "$file" != "$HOSTCTL_NGINX_BLOCKED_IPS_CONF" && "$file" != "$HOSTCTL_NGINX_ALLOWED_IPS_CONF" && "$file" != "$HOSTCTL_NGINX_RATE_ZONE_CONF" ]]; then
+            scope="$(extract_server_names_from_file "$file" | head -n 1 || true)"
+            [[ -n "$scope" ]] || scope="unknown"
+        fi
+
         line_no=0
         while IFS= read -r line; do
             line_no=$((line_no + 1))
-            line="${line#"${line%%[![:space:]]*}"}"
-            rule_record_matches_kind "$line" "$kind" || continue
+            trimmed="${line#"${line%%[![:space:]]*}"}"
+            rule_record_matches_kind "$trimmed" "$kind" || continue
+            marker="$trimmed"
+            marker_line="$line_no"
+            directive=""
 
-            scope="$(marker_scope "$line")"
-            value="$(marker_field "$line" value)"
-            rate="$(marker_field "$line" rate)"
-            burst="$(marker_field "$line" burst)"
-            zone="$(marker_field "$line" zone)"
-            mode="trusted only"
-            if [[ "$kind" == "allow" ]] && has_allow_only_for_scope "$scope"; then
-                mode="allow-only"
+            if [[ "$marker" == *":BEGIN "* || "$marker" == *":BEGIN" ]]; then
+                actual_kind="$(rule_kind_from_marker "$marker")"
+                while IFS= read -r line; do
+                    line_no=$((line_no + 1))
+                    trimmed="${line#"${line%%[![:space:]]*}"}"
+                    [[ "$trimmed" == "# HOSTCTL:"*":END"* ]] && break
+                    [[ -n "$directive" ]] || directive="$trimmed"
+                done
+                rule_record_from_marker "$kind" "$file" "$marker_line" "$marker" "$directive" || true
+            elif [[ "$marker" != *":END"* ]]; then
+                if IFS= read -r directive; then
+                    line_no=$((line_no + 1))
+                    directive="${directive#"${directive%%[![:space:]]*}"}"
+                    rule_record_from_marker "$kind" "$file" "$marker_line" "$marker" "$directive" || true
+                fi
             fi
-            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$kind" "$file" "$line_no" "$scope" "$value" "$rate" "$burst" "$zone" "$mode"
         done < "$file"
+        collect_legacy_managed_rules_from_file "$kind" "$file" "$scope"
     done < <(managed_rule_files)
+}
+
+parse_rule_record() {
+    local record="$1"
+
+    IFS='|' read -r \
+        RULE_TYPE \
+        RULE_SCOPE \
+        RULE_VALUE \
+        RULE_FILE \
+        RULE_ID \
+        RULE_LINE \
+        RULE_RATE \
+        RULE_BURST \
+        RULE_ZONE \
+        RULE_MODE <<< "$record"
+
+    if [[ ! "$RULE_LINE" =~ ^[0-9]+$ ]]; then
+        error "Invalid rule record line number: ${RULE_LINE}"
+        return 1
+    fi
+
+    if [[ ! -f "$RULE_FILE" ]]; then
+        error "Rule config file not found: ${RULE_FILE}"
+        return 1
+    fi
+
+    return 0
 }
 
 has_allow_only_for_scope() {
@@ -1768,7 +2112,7 @@ has_allow_only_for_scope() {
 count_allow_rules_for_scope() {
     local scope="$1"
 
-    collect_managed_rules allow | awk -F'|' -v scope="$scope" '$4 == scope { count++ } END { print count + 0 }'
+    collect_managed_rules allow | awk -F'|' -v scope="$scope" '$2 == scope { count++ } END { print count + 0 }'
 }
 
 print_rule_records() {
@@ -1799,11 +2143,12 @@ print_rule_records() {
 
     while IFS= read -r record; do
         index=$((index + 1))
-        scope="$(cut -d'|' -f4 <<< "$record")"
-        value="$(cut -d'|' -f5 <<< "$record")"
-        rate="$(cut -d'|' -f6 <<< "$record")"
-        burst="$(cut -d'|' -f7 <<< "$record")"
-        mode="$(cut -d'|' -f9 <<< "$record")"
+        parse_rule_record "$record" || return 1
+        scope="$RULE_SCOPE"
+        value="$RULE_VALUE"
+        rate="$RULE_RATE"
+        burst="$RULE_BURST"
+        mode="$RULE_MODE"
 
         case "$kind" in
             block)
@@ -1833,11 +2178,11 @@ select_managed_rule() {
 
     records="$(collect_managed_rules "$kind")"
     if [[ -z "$records" ]]; then
-        print_rule_records "$kind" "$title" || true
+        print_rule_records "$kind" "$title" >&2 || true
         return 1
     fi
 
-    print_rule_records "$kind" "$title" || true
+    print_rule_records "$kind" "$title" >&2 || true
     count="$(wc -l <<< "$records" | tr -d '[:space:]')"
 
     while true; do
@@ -1949,6 +2294,7 @@ insert_managed_block_in_location() {
     local log_name="$4"
     local domain="$5"
     local temp_file
+    local end_marker
 
     [[ -f "$target" ]] || die "Domain config not found: ${target}"
 
@@ -1958,12 +2304,14 @@ insert_managed_block_in_location() {
     fi
 
     temp_file="$(mktemp)"
-    awk -v marker="$marker" -v directive="$directive" '
+    end_marker="$(managed_end_marker "$marker")"
+    awk -v marker="$marker" -v directive="$directive" -v end_marker="$end_marker" '
         BEGIN { inserted = 0 }
         /location[[:space:]]+\/[[:space:]]*\{/ && inserted == 0 {
             print;
             print "        " marker;
             print "        " directive;
+            print "        " end_marker;
             inserted = 1;
             next;
         }
@@ -2005,11 +2353,25 @@ append_managed_global_rule() {
         return 0
     fi
 
-    printf '%s\n%s\n' "$marker" "$directive" >> "$temp_file"
+    printf '%s\n%s\n%s\n' "$marker" "$directive" "$(managed_end_marker "$marker")" >> "$temp_file"
     replace_file_from_temp_with_validation "$target" "$temp_file" "$log_name"
     local result=$?
     rm -f "$temp_file"
     return "$result"
+}
+
+managed_end_marker() {
+    local marker="$1"
+    local prefix
+    local id
+
+    prefix="${marker%%:BEGIN*}"
+    id="$(marker_field "$marker" id)"
+    if [[ -n "$id" ]]; then
+        printf '%s:END id=%s\n' "$prefix" "$id"
+    else
+        printf '%s:END\n' "$prefix"
+    fi
 }
 
 remove_marker_pair_from_file() {
@@ -2023,6 +2385,69 @@ remove_marker_pair_from_file() {
         skip == 1 { skip = 0; next }
         { print }
     ' "$file" > "$temp_file"
+    printf '%s\n' "$temp_file"
+}
+
+remove_rule_record_from_file() {
+    local file="$1"
+    local rule_id="$2"
+    local line_no="$3"
+    local temp_file
+
+    if [[ ! "$line_no" =~ ^[0-9]+$ ]]; then
+        error "Internal rule parsing error: invalid line number '${line_no}'"
+        return 1
+    fi
+
+    temp_file="$(mktemp)"
+    local awk_status=0
+    if awk -v rule_id="$rule_id" -v target_line="$line_no" '
+        function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+        rule_id != "" && $0 ~ /^# HOSTCTL:.*:BEGIN/ && $0 ~ (" id=" rule_id "([[:space:]]|$)") {
+            skip_block = 1;
+            removed = 1;
+            next;
+        }
+        skip_block {
+            if (trim($0) ~ /^# HOSTCTL:.*:END/ && $0 ~ (" id=" rule_id "([[:space:]]|$)")) skip_block = 0;
+            next;
+        }
+        removed == 0 && NR == target_line {
+            line = trim($0);
+            if (line ~ /^# HOSTCTL:.*:BEGIN/) {
+                skip_line_block = 1;
+                next
+            }
+            if (line ~ /^# HOSTCTL:/ || line == "# Managed by hostctl") {
+                skip_next = 1;
+                next;
+            }
+        }
+        skip_line_block {
+            if (trim($0) ~ /^# HOSTCTL:.*:END/) skip_line_block = 0;
+            next;
+        }
+        skip_next == 1 {
+            skip_next = 0;
+            next;
+        }
+        { print }
+        END {
+            if (rule_id != "" && rule_id !~ /^legacy_/ && removed == 0) exit 3
+        }
+    ' "$file" > "$temp_file"; then
+        awk_status=0
+    else
+        awk_status=$?
+    fi
+    if [[ "$awk_status" -eq 3 ]]; then
+        rm -f "$temp_file"
+        error "Managed rule marker not found: id=${rule_id}"
+        return 1
+    elif [[ "$awk_status" -ne 0 ]]; then
+        rm -f "$temp_file"
+        return 1
+    fi
     printf '%s\n' "$temp_file"
 }
 
@@ -2052,6 +2477,22 @@ remove_allow_only_for_scope() {
     local file
     local temp_file
     local changed="no"
+    local records
+    local record
+    local line_no
+
+    records="$(collect_managed_rules allow | awk -F'|' -v scope="$scope" '$4 == scope && $9 == "allow-only"')"
+    if [[ -n "$records" ]]; then
+        while IFS= read -r record; do
+            parse_rule_record "$record" || return 1
+            file="$RULE_FILE"
+            line_no="$RULE_LINE"
+            temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no")" || return 1
+            cp "$temp_file" "$file"
+            rm -f "$temp_file"
+            changed="yes"
+        done <<< "$records"
+    fi
 
     while IFS= read -r file; do
         [[ -f "$file" ]] || continue
@@ -2172,10 +2613,10 @@ add_block_ip_rule() {
     target="$(target_for_scope "$scope" block)" || return 1
     directive="deny ${value};"
     if [[ "$scope" == "global" ]]; then
-        marker="# HOSTCTL:BLOCK-IP:scope=global:value=${value}"
+        marker="# HOSTCTL:BLOCK-IP:BEGIN id=$(rule_id block "$value") scope=global value=${value}"
         append_managed_global_rule "$target" "$marker" "$directive" "NGINX_BLOCK_IP_ADD"
     else
-        marker="# HOSTCTL:BLOCK-IP:domain=${scope}:value=${value}"
+        marker="# HOSTCTL:BLOCK-IP:BEGIN id=$(rule_id block "$value") domain=${scope} value=${value}"
         insert_managed_block_in_location "$target" "$marker" "$directive" "NGINX_BLOCK_IP_ADD" "$scope"
     fi
 }
@@ -2198,42 +2639,31 @@ add_allow_ip_rule() {
     fi
 
     if [[ "$scope" == "global" ]]; then
-        marker="# HOSTCTL:ALLOW-IP:scope=global:value=${value}"
+        if [[ "$mode" == "allow-only" ]]; then
+            marker="# HOSTCTL:ALLOW-ONLY:BEGIN id=$(rule_id allow "$value") scope=global value=${value}"
+        else
+            marker="# HOSTCTL:ALLOW-IP:BEGIN id=$(rule_id allow "$value") scope=global value=${value}"
+        fi
         temp_file="$(mktemp)"
         [[ -f "$target" ]] && cp "$target" "$temp_file" || printf '# Managed by hostctl\n' > "$temp_file"
         grep -Fq "$marker" "$temp_file" || printf '%s\n%s\n' "$marker" "$directive" >> "$temp_file"
-        if [[ "$mode" == "allow-only" ]] && ! grep -Fq "# HOSTCTL:ALLOW-ONLY:scope=global" "$temp_file"; then
-            printf '# HOSTCTL:ALLOW-ONLY:scope=global\ndeny all;\n' >> "$temp_file"
+        if [[ "$mode" == "allow-only" ]]; then
+            printf 'deny all;\n%s\n' "$(managed_end_marker "$marker")" >> "$temp_file"
+        else
+            printf '%s\n' "$(managed_end_marker "$marker")" >> "$temp_file"
         fi
         replace_file_from_temp_with_validation "$target" "$temp_file" "NGINX_ALLOW_IP_ADD"
         local result=$?
         rm -f "$temp_file"
         return "$result"
     else
-        marker="# HOSTCTL:ALLOW-IP:domain=${scope}:value=${value}"
-        insert_managed_block_in_location "$target" "$marker" "$directive" "NGINX_ALLOW_IP_ADD" "$scope" || return 1
-        if [[ "$mode" == "allow-only" ]] && ! has_allow_only_for_scope "$scope"; then
-            backup="$(backup_file "$target" || true)"
-            temp_file="$(mktemp)"
-            awk -v marker="# HOSTCTL:ALLOW-ONLY:domain=${scope}" '
-                BEGIN { inserted = 0 }
-                /location[[:space:]]+\/[[:space:]]*\{/ && inserted == 0 {
-                    print;
-                    print "        " marker;
-                    print "        deny all;";
-                    inserted = 1;
-                    next
-                }
-                { print }
-            ' "$target" > "$temp_file"
-            cp "$temp_file" "$target"
-            rm -f "$temp_file"
-            nginx_test_and_reload "$scope" || {
-                rollback_file "$backup" "$target" || true
-                validate_nginx_config || true
-                return 1
-            }
+        if [[ "$mode" == "allow-only" ]]; then
+            marker="# HOSTCTL:ALLOW-ONLY:BEGIN id=$(rule_id allow "$value") domain=${scope} value=${value}"
+            directive="$(printf 'allow %s;\n        deny all;' "$value")"
+        else
+            marker="# HOSTCTL:ALLOW-IP:BEGIN id=$(rule_id allow "$value") domain=${scope} value=${value}"
         fi
+        insert_managed_block_in_location "$target" "$marker" "$directive" "NGINX_ALLOW_IP_ADD" "$scope" || return 1
     fi
 }
 
@@ -2282,15 +2712,14 @@ cmd_nginx_block_ip_edit() {
     local old_value
     local new_value
     local new_scope
-    local old_marker
     local temp_file
 
     record="$(select_managed_rule block "Blocked IP Rules")" || return 0
-    file="$(cut -d'|' -f2 <<< "$record")"
-    line_no="$(cut -d'|' -f3 <<< "$record")"
-    scope="$(cut -d'|' -f4 <<< "$record")"
-    old_value="$(cut -d'|' -f5 <<< "$record")"
-    old_marker="$(sed -n "${line_no}p" "$file")"
+    parse_rule_record "$record" || return 1
+    file="$RULE_FILE"
+    line_no="$RULE_LINE"
+    scope="$RULE_SCOPE"
+    old_value="$RULE_VALUE"
 
     echo "Current IP/CIDR: ${old_value}"
     while true; do
@@ -2300,13 +2729,17 @@ cmd_nginx_block_ip_edit() {
     done
     new_scope="$(select_scope_for_rule "$scope")" || return 1
 
-    temp_file="$(remove_marker_pair_from_file "$file" "$old_marker")"
+    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no")" || return 1
     replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_BLOCK_IP_EDIT" "$([[ "$scope" != "global" ]] && printf '%s' "$scope")" || {
         rm -f "$temp_file"
         return 1
     }
     rm -f "$temp_file"
-    add_block_ip_rule "$new_scope" "$new_value"
+    if add_block_ip_rule "$new_scope" "$new_value"; then
+        success "Block rule updated."
+        return 0
+    fi
+    return 1
 }
 
 cmd_nginx_block_ip_remove() {
@@ -2319,21 +2752,21 @@ cmd_nginx_block_ip_remove() {
     local line_no
     local scope
     local value
-    local marker
     local temp_file
 
     record="$(select_managed_rule block "Blocked IP Rules")" || return 0
-    file="$(cut -d'|' -f2 <<< "$record")"
-    line_no="$(cut -d'|' -f3 <<< "$record")"
-    scope="$(cut -d'|' -f4 <<< "$record")"
-    value="$(cut -d'|' -f5 <<< "$record")"
-    marker="$(sed -n "${line_no}p" "$file")"
+    parse_rule_record "$record" || return 1
+    file="$RULE_FILE"
+    line_no="$RULE_LINE"
+    scope="$RULE_SCOPE"
+    value="$RULE_VALUE"
 
-    confirm "Remove block rule for ${value} from ${scope}?" "no" || return 0
-    temp_file="$(remove_marker_pair_from_file "$file" "$marker")"
+    confirm "Remove ${value} from ${scope}?" "no" || return 0
+    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no")" || return 1
     replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_BLOCK_IP_REMOVE" "$([[ "$scope" != "global" ]] && printf '%s' "$scope")"
     local result=$?
     rm -f "$temp_file"
+    [[ "$result" -eq 0 ]] && success "Block rule removed."
     return "$result"
 }
 
@@ -2379,14 +2812,14 @@ cmd_nginx_whitelist_ip_edit() {
     require_debian_based
     ensure_nginx_installed
 
-    local record file line_no scope old_value old_marker new_value new_scope mode_choice mode temp_file
+    local record file line_no scope old_value new_value new_scope mode_choice mode temp_file
 
     record="$(select_managed_rule allow "Whitelist Rules")" || return 0
-    file="$(cut -d'|' -f2 <<< "$record")"
-    line_no="$(cut -d'|' -f3 <<< "$record")"
-    scope="$(cut -d'|' -f4 <<< "$record")"
-    old_value="$(cut -d'|' -f5 <<< "$record")"
-    old_marker="$(sed -n "${line_no}p" "$file")"
+    parse_rule_record "$record" || return 1
+    file="$RULE_FILE"
+    line_no="$RULE_LINE"
+    scope="$RULE_SCOPE"
+    old_value="$RULE_VALUE"
 
     echo "Current IP/CIDR: ${old_value}"
     while true; do
@@ -2399,7 +2832,7 @@ cmd_nginx_whitelist_ip_edit() {
     mode="trusted"
     [[ "$mode_choice" == "allow-only" ]] && mode="allow-only"
 
-    temp_file="$(remove_marker_pair_from_file "$file" "$old_marker")"
+    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no")" || return 1
     replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_ALLOW_IP_EDIT" "$([[ "$scope" != "global" ]] && printf '%s' "$scope")" || {
         rm -f "$temp_file"
         return 1
@@ -2414,7 +2847,11 @@ cmd_nginx_whitelist_ip_edit() {
         remove_allow_only_for_scope "$scope" || true
         nginx_test_and_reload "$([[ "$scope" != "global" ]] && printf '%s' "$scope")" || return 1
     fi
-    add_allow_ip_rule "$new_scope" "$new_value" "$mode"
+    if add_allow_ip_rule "$new_scope" "$new_value" "$mode"; then
+        success "Whitelist rule updated."
+        return 0
+    fi
+    return 1
 }
 
 cmd_nginx_whitelist_ip_remove() {
@@ -2422,14 +2859,14 @@ cmd_nginx_whitelist_ip_remove() {
     require_debian_based
     ensure_nginx_installed
 
-    local record file line_no scope value marker temp_file allow_count remove_deny="no"
+    local record file line_no scope value temp_file allow_count remove_deny="no"
 
     record="$(select_managed_rule allow "Whitelist Rules")" || return 0
-    file="$(cut -d'|' -f2 <<< "$record")"
-    line_no="$(cut -d'|' -f3 <<< "$record")"
-    scope="$(cut -d'|' -f4 <<< "$record")"
-    value="$(cut -d'|' -f5 <<< "$record")"
-    marker="$(sed -n "${line_no}p" "$file")"
+    parse_rule_record "$record" || return 1
+    file="$RULE_FILE"
+    line_no="$RULE_LINE"
+    scope="$RULE_SCOPE"
+    value="$RULE_VALUE"
 
     if has_allow_only_for_scope "$scope"; then
         allow_count="$(count_allow_rules_for_scope "$scope")"
@@ -2441,7 +2878,7 @@ cmd_nginx_whitelist_ip_remove() {
     fi
 
     confirm "Remove whitelist rule for ${value} from ${scope}?" "no" || return 0
-    temp_file="$(remove_marker_pair_from_file "$file" "$marker")"
+    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no")" || return 1
     replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_ALLOW_IP_REMOVE" "$([[ "$scope" != "global" ]] && printf '%s' "$scope")" || {
         rm -f "$temp_file"
         return 1
@@ -2451,6 +2888,7 @@ cmd_nginx_whitelist_ip_remove() {
         remove_allow_only_for_scope "$scope" || true
         nginx_test_and_reload "$([[ "$scope" != "global" ]] && printf '%s' "$scope")"
     fi
+    success "Whitelist rule removed."
 }
 
 render_rate_zone_file_from_markers() {
@@ -2466,11 +2904,15 @@ render_rate_zone_file_from_markers() {
     [[ -z "$records" ]] && return 0
 
     while IFS= read -r record; do
-        domain="$(cut -d'|' -f4 <<< "$record")"
-        rate="$(cut -d'|' -f6 <<< "$record")"
+        parse_rule_record "$record" || return 1
+        domain="$RULE_SCOPE"
+        rate="$RULE_RATE"
         zone="$(rate_zone_name "$domain")"
-        printf '# HOSTCTL:RATE-ZONE:domain=%s:zone=%s:rate=%s\n' "$domain" "$zone" "$rate" >> "$output"
+        local marker
+        marker="# HOSTCTL:RATE-ZONE:BEGIN id=$(rule_id zone "$domain") domain=${domain} zone=${zone} rate=${rate}"
+        printf '%s\n' "$marker" >> "$output"
         printf 'limit_req_zone $binary_remote_addr zone=%s:10m rate=%sr/s;\n' "$zone" "$rate" >> "$output"
+        printf '%s\n' "$(managed_end_marker "$marker")" >> "$output"
     done <<< "$records"
 }
 
@@ -2487,7 +2929,7 @@ add_rate_limit_rule() {
     assert_single_enabled_domain_owner "$domain" || return 1
     target="$(domain_config_for_rule_scope "$domain")" || return 1
     zone="$(rate_zone_name "$domain")"
-    marker="# HOSTCTL:RATE-LIMIT:domain=${domain}:rate=${rate}:burst=${burst}"
+    marker="# HOSTCTL:RATE-LIMIT:BEGIN id=$(rule_id rate "$domain") domain=${domain} rate=${rate} burst=${burst} zone=${zone}"
     directive="limit_req zone=${zone} burst=${burst} nodelay;"
 
     insert_managed_block_in_location "$target" "$marker" "$directive" "NGINX_RATE_LIMIT_ADD" "$domain" || return 1
@@ -2497,6 +2939,20 @@ add_rate_limit_rule() {
     local result=$?
     rm -f "$temp_file"
     return "$result"
+}
+
+rate_zone_referenced_elsewhere() {
+    local zone="$1"
+    local exclude_file="${2:-}"
+    local file
+
+    while IFS= read -r file; do
+        [[ -f "$file" ]] || continue
+        [[ -n "$exclude_file" && "$file" == "$exclude_file" ]] && continue
+        grep -Fq "limit_req zone=${zone}" "$file" && return 0
+    done < <(managed_rule_files)
+
+    return 1
 }
 
 cmd_nginx_rate_limit() {
@@ -2537,28 +2993,32 @@ cmd_nginx_rate_limit_edit() {
     require_debian_based
     ensure_nginx_installed
 
-    local record file line_no domain old_marker rate_burst rate burst temp_file
+    local record file line_no domain rate_burst rate burst temp_file
 
     record="$(select_managed_rule rate "Rate Limits")" || return 0
-    file="$(cut -d'|' -f2 <<< "$record")"
-    line_no="$(cut -d'|' -f3 <<< "$record")"
-    domain="$(cut -d'|' -f4 <<< "$record")"
-    old_marker="$(sed -n "${line_no}p" "$file")"
+    parse_rule_record "$record" || return 1
+    file="$RULE_FILE"
+    line_no="$RULE_LINE"
+    domain="$RULE_SCOPE"
 
     echo "Domain: ${domain}"
-    echo "Rate: $(cut -d'|' -f6 <<< "$record") req/s"
-    echo "Burst: $(cut -d'|' -f7 <<< "$record")"
+    echo "Rate: ${RULE_RATE} req/s"
+    echo "Burst: ${RULE_BURST}"
     rate_burst="$(select_rate_profile)"
     rate="${rate_burst%%|*}"
     burst="${rate_burst##*|}"
 
-    temp_file="$(remove_marker_pair_from_file "$file" "$old_marker")"
+    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no")" || return 1
     replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_RATE_LIMIT_EDIT" "$domain" || {
         rm -f "$temp_file"
         return 1
     }
     rm -f "$temp_file"
-    add_rate_limit_rule "$domain" "$rate" "$burst"
+    if add_rate_limit_rule "$domain" "$rate" "$burst"; then
+        success "Rate limit updated."
+        return 0
+    fi
+    return 1
 }
 
 cmd_nginx_rate_limit_remove() {
@@ -2566,27 +3026,35 @@ cmd_nginx_rate_limit_remove() {
     require_debian_based
     ensure_nginx_installed
 
-    local record file line_no domain old_marker temp_file zone_file
+    local record file line_no domain temp_file zone_file zone
 
     record="$(select_managed_rule rate "Rate Limits")" || return 0
-    file="$(cut -d'|' -f2 <<< "$record")"
-    line_no="$(cut -d'|' -f3 <<< "$record")"
-    domain="$(cut -d'|' -f4 <<< "$record")"
-    old_marker="$(sed -n "${line_no}p" "$file")"
+    parse_rule_record "$record" || return 1
+    file="$RULE_FILE"
+    line_no="$RULE_LINE"
+    domain="$RULE_SCOPE"
+    zone="$RULE_ZONE"
+    [[ -n "$zone" ]] || zone="$(rate_zone_name "$domain")"
 
     confirm "Remove rate limit for ${domain}?" "no" || return 0
-    temp_file="$(remove_marker_pair_from_file "$file" "$old_marker")"
+    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no")" || return 1
     replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_RATE_LIMIT_REMOVE" "$domain" || {
         rm -f "$temp_file"
         return 1
     }
     rm -f "$temp_file"
 
+    if rate_zone_referenced_elsewhere "$zone" "$file"; then
+        info "Rate limit zone ${zone} is still referenced; keeping managed zone definition."
+        return 0
+    fi
+
     zone_file="$(mktemp)"
     render_rate_zone_file_from_markers "$zone_file"
     replace_file_from_temp_with_validation "$HOSTCTL_NGINX_RATE_ZONE_CONF" "$zone_file" "NGINX_RATE_LIMIT_REMOVE" "$domain"
     local result=$?
     rm -f "$zone_file"
+    [[ "$result" -eq 0 ]] && success "Rate limit removed."
     return "$result"
 }
 
