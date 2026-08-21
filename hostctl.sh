@@ -15,6 +15,7 @@ SYSTEM_LIB="${SCRIPT_DIR}/lib/system.sh"
 DOCKER_LIB="${SCRIPT_DIR}/lib/docker.sh"
 NGINX_LIB="${SCRIPT_DIR}/lib/nginx.sh"
 SSL_LIB="${SCRIPT_DIR}/lib/ssl.sh"
+FIREWALL_LIB="${SCRIPT_DIR}/lib/firewall.sh"
 
 # ---------------------------------------------------------
 # Load required libraries
@@ -62,6 +63,13 @@ fi
 
 # shellcheck source=lib/ssl.sh
 source "$SSL_LIB"
+
+if [[ ! -f "$FIREWALL_LIB" ]]; then
+    die "Missing required library: $FIREWALL_LIB"
+fi
+
+# shellcheck source=lib/firewall.sh
+source "$FIREWALL_LIB"
 
 # ---------------------------------------------------------
 # Help
@@ -382,12 +390,24 @@ case "$COMMAND" in
         ;;
 
     # Firewall
-    --firewall|\
-    --allow-port|\
-    --deny-port|\
-    --firewall-status|\
+    --firewall)
+        cmd_firewall "$@"
+        ;;
+
+    --allow-port)
+        cmd_allow_port "$@"
+        ;;
+
+    --deny-port)
+        cmd_deny_port "$@"
+        ;;
+
+    --firewall-status)
+        cmd_firewall_status "$@"
+        ;;
+
     --firewall-reset)
-        die "${COMMAND} is not implemented yet."
+        cmd_firewall_reset "$@"
         ;;
 
     # Database / Backup
