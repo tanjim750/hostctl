@@ -17,6 +17,13 @@ HOSTCTL_NGINX_BLOCKED_IPS_CONF="${NGINX_CONF_D}/hostctl-blocked-ips.conf"
 HOSTCTL_NGINX_ALLOWED_IPS_CONF="${NGINX_CONF_D}/hostctl-allowed-ips.conf"
 HOSTCTL_NGINX_DOMAIN_SNIPPET="${NGINX_SNIPPETS}/hostctl-domain-access.conf"
 
+DOMAIN_TARGET_PATH=""
+DOMAIN_ENABLED_PATH=""
+DOMAIN_CONFLICT_LINK_TO_DISABLE=""
+DOMAIN_CONFLICT_LINK_TARGET=""
+DOMAIN_CONFLICT_BACKUP=""
+NGINX_LAST_TEST_OUTPUT=""
+
 # ---------------------------------------------------------
 # Common helpers
 # ---------------------------------------------------------
@@ -41,8 +48,40 @@ ensure_nginx_installed() {
     ensure_nginx_layout
 }
 
+nginx_test_output_has_conflict() {
+    grep -qi 'conflicting server name' <<< "$NGINX_LAST_TEST_OUTPUT"
+}
+
+nginx_test_output_has_domain_conflict() {
+    local domain="$1"
+
+    [[ -n "$domain" ]] &&
+    grep -qi 'conflicting server name' <<< "$NGINX_LAST_TEST_OUTPUT" &&
+    grep -Fqi "$domain" <<< "$NGINX_LAST_TEST_OUTPUT"
+}
+
 validate_nginx_config() {
-    nginx -t
+    local domain="${1:-}"
+    local output
+    local status=0
+
+    output="$(nginx -t 2>&1)" || status=$?
+    NGINX_LAST_TEST_OUTPUT="$output"
+    printf '%s\n' "$output" >&2
+
+    if (( status != 0 )); then
+        return "$status"
+    fi
+
+    if nginx_test_output_has_conflict; then
+        warning "Nginx syntax is valid, but configuration conflicts were detected."
+        if nginx_test_output_has_domain_conflict "$domain"; then
+            error "Configuration conflict involves ${domain}."
+            return 1
+        fi
+    fi
+
+    return 0
 }
 
 reload_nginx() {
@@ -50,7 +89,9 @@ reload_nginx() {
 }
 
 nginx_test_and_reload() {
-    validate_nginx_config || return 1
+    local domain="${1:-}"
+
+    validate_nginx_config "$domain" || return 1
     reload_nginx || return 1
 }
 
@@ -166,8 +207,13 @@ show_nginx_status() {
     service="$(systemctl is-active nginx 2>/dev/null || printf 'unknown')"
     enabled="$(systemctl is-enabled nginx 2>/dev/null || printf 'unknown')"
 
-    if nginx -t >/dev/null 2>&1; then
-        config="valid"
+    local test_output
+    if test_output="$(nginx -t 2>&1)"; then
+        if grep -qi 'conflicting server name' <<< "$test_output"; then
+            config="valid with conflicts"
+        else
+            config="valid"
+        fi
     fi
 
     if nginx_port_listening 80; then
@@ -211,22 +257,65 @@ normalize_domain() {
 }
 
 detect_nginx_domains() {
-    local domain
+    {
+        extract_domains_from_config_dir "$NGINX_SITES_ENABLED"
+        extract_domains_from_config_dir "$NGINX_SITES_AVAILABLE"
+    } | sort -u
+}
 
-    if [[ -d "$NGINX_SITES_AVAILABLE" ]]; then
-        find "$NGINX_SITES_AVAILABLE" -maxdepth 1 -type f -print |
-            while IFS= read -r file; do
-                basename "$file"
-                awk '
-                    /server_name/ {
-                        for (i = 2; i <= NF; i++) {
-                            gsub(/;/, "", $i);
-                            if ($i != "_" && $i !~ /\*/) print $i;
-                        }
+is_ignored_nginx_config_path() {
+    local path="$1"
+    local name
+
+    name="$(basename "$path")"
+
+    [[ "$name" == default ]] ||
+    [[ "$name" == *.bak ]] ||
+    [[ "$name" == *.hostctl.* ]] ||
+    [[ "$name" == *~ ]] ||
+    [[ "$name" == *.tmp ]] ||
+    [[ "$name" == *.disabled ]]
+}
+
+extract_server_names_from_file() {
+    local file="$1"
+
+    awk '
+        /^[[:space:]]*#/ { next }
+        /server_name[[:space:]]/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "server_name") {
+                    for (j = i + 1; j <= NF; j++) {
+                        name = $j;
+                        gsub(/;/, "", name);
+                        if (name != "_" && name !~ /\*/ && name != "") print name;
+                        if ($j ~ /;/) break;
                     }
-                ' "$file"
-            done | sort -u
-    fi
+                }
+            }
+        }
+    ' "$file"
+}
+
+extract_domains_from_config_dir() {
+    local dir="$1"
+    local file
+    local resolved
+
+    [[ -d "$dir" ]] || return 0
+
+    find "$dir" -maxdepth 1 \( -type f -o -type l \) -print |
+        while IFS= read -r file; do
+            is_ignored_nginx_config_path "$file" && continue
+            if [[ -L "$file" ]]; then
+                resolved="$(real_config_path "$file" 2>/dev/null || true)"
+                [[ -n "$resolved" && -f "$resolved" ]] || continue
+                is_ignored_nginx_config_path "$resolved" && continue
+                extract_server_names_from_file "$resolved"
+            elif [[ -f "$file" ]]; then
+                extract_server_names_from_file "$file"
+            fi
+        done
 }
 
 select_nginx_domain() {
@@ -293,6 +382,126 @@ domain_available_path() {
 
 domain_enabled_path() {
     printf '%s/%s\n' "$NGINX_SITES_ENABLED" "$1"
+}
+
+real_config_path() {
+    local path="$1"
+    local link_target
+    local link_dir
+
+    if [[ -L "$path" ]]; then
+        link_target="$(readlink "$path")" || return 1
+        if [[ "$link_target" != /* ]]; then
+            link_dir="$(cd "$(dirname "$path")" && pwd -P)" || return 1
+            link_target="${link_dir}/${link_target}"
+        fi
+        link_dir="$(cd "$(dirname "$link_target")" && pwd -P)" || return 1
+        printf '%s/%s\n' "$link_dir" "$(basename "$link_target")"
+    else
+        printf '%s\n' "$path"
+    fi
+}
+
+config_declares_domain() {
+    local file="$1"
+    local domain="$2"
+    local server_name
+
+    [[ -f "$file" ]] || return 1
+
+    while IFS= read -r server_name; do
+        if [[ "$server_name" == "$domain" ]]; then
+            return 0
+        fi
+    done < <(extract_server_names_from_file "$file")
+
+    return 1
+}
+
+find_enabled_domain_owner() {
+    local domain="$1"
+    local ignore_path="${2:-}"
+    local ignore_real=""
+    local enabled
+    local resolved
+
+    [[ -d "$NGINX_SITES_ENABLED" ]] || return 1
+    [[ -n "$ignore_path" ]] && ignore_real="$(real_config_path "$ignore_path" 2>/dev/null || true)"
+
+    find "$NGINX_SITES_ENABLED" -maxdepth 1 \( -type f -o -type l \) -print |
+        while IFS= read -r enabled; do
+            is_ignored_nginx_config_path "$enabled" && continue
+            resolved="$(real_config_path "$enabled" 2>/dev/null || true)"
+            [[ -n "$resolved" && -f "$resolved" ]] || continue
+            is_ignored_nginx_config_path "$resolved" && continue
+
+            if [[ -n "$ignore_path" ]] &&
+               { [[ "$enabled" == "$ignore_path" ]] || [[ "$resolved" == "$ignore_path" ]] || [[ -n "$ignore_real" && "$resolved" == "$ignore_real" ]]; }; then
+                continue
+            fi
+
+            if config_declares_domain "$resolved" "$domain"; then
+                printf '%s|%s\n' "$enabled" "$resolved"
+                return 0
+            fi
+        done
+}
+
+resolve_domain_deployment_target() {
+    local domain="$1"
+    local default_target
+    local default_enabled
+    local conflict=""
+    local conflict_link
+    local conflict_target
+    local action
+
+    default_target="$(domain_available_path "$domain")"
+    default_enabled="$(domain_enabled_path "$domain")"
+
+    DOMAIN_TARGET_PATH="$default_target"
+    DOMAIN_ENABLED_PATH="$default_enabled"
+    DOMAIN_CONFLICT_LINK_TO_DISABLE=""
+    DOMAIN_CONFLICT_LINK_TARGET=""
+    DOMAIN_CONFLICT_BACKUP=""
+
+    conflict="$(find_enabled_domain_owner "$domain" "$default_target" | head -n 1 || true)"
+    [[ -z "$conflict" ]] && return 0
+
+    conflict_link="${conflict%%|*}"
+    conflict_target="${conflict#*|}"
+
+    echo
+    printf 'Domain %s is already configured in:\n' "$domain"
+    echo
+    printf '%s\n' "$conflict_link"
+    echo
+
+    action="$(
+        select_option \
+            "Duplicate domain action:" \
+            "Use/update the existing configuration" \
+            "Disable the existing configuration and create hostctl config" \
+            "Cancel"
+    )"
+
+    case "$action" in
+        "Use/update the existing configuration")
+            DOMAIN_TARGET_PATH="$conflict_target"
+            DOMAIN_ENABLED_PATH="$conflict_link"
+            ;;
+        "Disable the existing configuration and create hostctl config")
+            DOMAIN_CONFLICT_LINK_TO_DISABLE="$conflict_link"
+            DOMAIN_CONFLICT_LINK_TARGET="$(readlink "$conflict_link" 2>/dev/null || printf '%s\n' "$conflict_target")"
+            if [[ -f "$conflict_target" ]]; then
+                DOMAIN_CONFLICT_BACKUP="$(backup_file "$conflict_target" || true)"
+            fi
+            ;;
+        "Cancel")
+            warning "Domain configuration cancelled."
+            return 1
+            ;;
+    esac
 }
 
 hostctl_domain_exists() {
@@ -569,14 +778,16 @@ deploy_domain_config() {
     local had_symlink="no"
     local symlink_target=""
 
-    target="$(domain_available_path "$domain")"
-    enabled="$(domain_enabled_path "$domain")"
+    resolve_domain_deployment_target "$domain" || return 0
+
+    target="$DOMAIN_TARGET_PATH"
+    enabled="$DOMAIN_ENABLED_PATH"
 
     if [[ -f "$target" ]]; then
         backup="$(backup_file "$target" || true)"
         if ! grep -q 'Managed by hostctl' "$target"; then
-            warning "This Nginx configuration was not created by hostctl."
-            warning "hostctl will create a backup before modifying it."
+            warning "This configuration was not created by hostctl."
+            warning "A backup will be created before modification."
             if ! confirm "Continue?" "no"; then
                 warning "Domain update cancelled."
                 return 0
@@ -589,10 +800,22 @@ deploy_domain_config() {
         symlink_target="$(readlink "$enabled")"
     fi
 
-    cp "$temp_file" "$target" || return 1
-    ln -sfn "$target" "$enabled"
+    if [[ -n "$DOMAIN_CONFLICT_LINK_TO_DISABLE" ]]; then
+        rm -f "$DOMAIN_CONFLICT_LINK_TO_DISABLE"
+    fi
 
-    if nginx_test_and_reload; then
+    cp "$temp_file" "$target" || {
+        restore_conflicting_domain_link
+        return 1
+    }
+
+    ln -sfn "$target" "$enabled" || {
+        restore_file_backup "$backup" "$target"
+        restore_conflicting_domain_link
+        return 1
+    }
+
+    if nginx_test_and_reload "$domain"; then
         log_event "NGINX_DOMAIN_CREATE domain=${domain} result=success"
         success "Domain configured: ${domain}"
         return 0
@@ -604,9 +827,19 @@ deploy_domain_config() {
     if [[ "$had_symlink" == "yes" ]]; then
         ln -sfn "$symlink_target" "$enabled"
     fi
+    restore_conflicting_domain_link
     validate_nginx_config || true
     log_event "NGINX_DOMAIN_CREATE domain=${domain} result=failed"
     return 1
+}
+
+restore_conflicting_domain_link() {
+    if [[ -n "$DOMAIN_CONFLICT_LINK_TO_DISABLE" ]]; then
+        ln -sfn "$DOMAIN_CONFLICT_LINK_TARGET" "$DOMAIN_CONFLICT_LINK_TO_DISABLE"
+        if [[ -n "$DOMAIN_CONFLICT_BACKUP" && -f "$DOMAIN_CONFLICT_BACKUP" ]]; then
+            rollback_file "$DOMAIN_CONFLICT_BACKUP" "$(real_config_path "$DOMAIN_CONFLICT_LINK_TO_DISABLE")" || true
+        fi
+    fi
 }
 
 inspect_domain_config() {
