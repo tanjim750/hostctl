@@ -37,6 +37,7 @@ BACKUP_LAST_SIZE=""
 BACKUP_LAST_REMOTE_RESULT=""
 BACKUP_LAST_RESULT=""
 BACKUP_LAST_ERROR=""
+BACKUP_PREFLIGHT_DONE=0
 
 # ---------------------------------------------------------
 # Common helpers
@@ -116,6 +117,7 @@ reset_backup_config() {
     BACKUP_LAST_REMOTE_RESULT=""
     BACKUP_LAST_RESULT=""
     BACKUP_LAST_ERROR=""
+    BACKUP_PREFLIGHT_DONE=0
 }
 
 backup_config_default_profile_name() {
@@ -211,6 +213,37 @@ read_secret() {
     fi
 
     printf '%s\n' "$value"
+}
+
+ask_required_input() {
+    local prompt="$1"
+    local value
+
+    while true; do
+        value="$(ask_input "$prompt")" || return 1
+        if [[ -n "$value" ]]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+        warning "${prompt} is required."
+    done
+}
+
+backup_client_name() {
+    case "$1" in
+        postgres) printf 'pg_dump\n' ;;
+        mysql) printf 'mysqldump\n' ;;
+        mariadb) printf 'mariadb-dump or mysqldump\n' ;;
+    esac
+}
+
+db_engine_label() {
+    case "$1" in
+        postgres) printf 'PostgreSQL\n' ;;
+        mysql) printf 'MySQL\n' ;;
+        mariadb) printf 'MariaDB\n' ;;
+        *) printf '%s\n' "$1" ;;
+    esac
 }
 
 backup_disk_space_check() {
@@ -406,21 +439,38 @@ select_db_type() {
 
 detect_docker_db_type_for_service() {
     local service="$1"
-    local image
+    local service_block
     local lowered
 
-    image="$(compose_exec config 2>/dev/null | awk -v service="$service" '
+    service_block="$(compose_exec config 2>/dev/null | awk -v service="$service" '
         $1 == service ":" { in_service = 1; next }
         in_service && /^[[:space:]]{2}[A-Za-z0-9_.-]+:/ { exit }
-        in_service && $1 == "image:" { print $2; exit }
+        in_service { print }
     ' || true)"
-    lowered="$(tr '[:upper:]' '[:lower:]' <<< "${service} ${image}")"
+    lowered="$(tr '[:upper:]' '[:lower:]' <<< "${service} ${service_block}")"
 
     case "$lowered" in
-        *postgres*) printf 'postgres\n' ;;
-        *mariadb*) printf 'mariadb\n' ;;
-        *mysql*) printf 'mysql\n' ;;
+        *postgres*|*postgres_db*|*postgres_user*|*5432*) printf 'postgres\n' ;;
+        *mariadb*|*mariadb_database*) printf 'mariadb\n' ;;
+        *mysql*|*mysql_database*|*3306*) printf 'mysql\n' ;;
         *) return 1 ;;
+    esac
+}
+
+docker_service_has_client() {
+    local service="$1"
+    local db_type="$2"
+
+    case "$db_type" in
+        postgres)
+            compose_exec exec -T "$service" sh -c 'command -v pg_dump >/dev/null 2>&1'
+            ;;
+        mysql)
+            compose_exec exec -T "$service" sh -c 'command -v mysqldump >/dev/null 2>&1'
+            ;;
+        mariadb)
+            compose_exec exec -T "$service" sh -c 'command -v mariadb-dump >/dev/null 2>&1 || command -v mysqldump >/dev/null 2>&1'
+            ;;
     esac
 }
 
@@ -443,6 +493,15 @@ select_docker_db_service() {
         BACKUP_DB_SERVICE="${candidates[0]%%|*}"
         BACKUP_DB_TYPE="${candidates[0]#*|}"
         [[ -n "$BACKUP_DB_TYPE" ]] || BACKUP_DB_TYPE="$(select_db_type)"
+        echo
+        printf 'Detected %s database service:\n%s\n' "$(db_engine_label "$BACKUP_DB_TYPE")" "$BACKUP_DB_SERVICE"
+        echo
+        if ! confirm "Use this service?" "yes"; then
+            BACKUP_DB_SERVICE=""
+            BACKUP_DB_TYPE=""
+            select_docker_db_service
+            return
+        fi
         return 0
     fi
 
@@ -469,8 +528,366 @@ select_docker_db_service() {
         done
     fi
 
-    BACKUP_DB_SERVICE="$(select_compose_service)" || return 1
-    BACKUP_DB_TYPE="$(select_db_type)" || return 1
+    warning "No PostgreSQL/MySQL/MariaDB service was detected in this Compose stack."
+    echo
+    local location
+    location="$(
+        select_option \
+            "Database location:" \
+            "Database runs inside another Compose service" \
+            "Database is external/native" \
+            "Enter container/service manually" \
+            "Cancel"
+    )" || return 1
+
+    case "$location" in
+        "Database runs inside another Compose service")
+            BACKUP_DB_SERVICE="$(select_compose_service)" || return 1
+            BACKUP_DB_TYPE="$(select_db_type)" || return 1
+            ;;
+        "Database is external/native")
+            collect_native_database_config
+            return
+            ;;
+        "Enter container/service manually")
+            BACKUP_DB_SERVICE="$(ask_required_input "Compose service/container")" || return 1
+            BACKUP_DB_TYPE="$(select_db_type)" || return 1
+            ;;
+        "Cancel")
+            return 1
+            ;;
+    esac
+}
+
+resolve_required_env_value() {
+    local label="$1"
+    local var_name_ref="$2"
+    local value_name_ref="$3"
+    local default_var="${!var_name_ref}"
+    local action
+    local value=""
+
+    while true; do
+        if [[ -n "$BACKUP_ENV_FILE" && -n "$default_var" ]]; then
+            value="$(env_file_value "$BACKUP_ENV_FILE" "$default_var" || true)"
+        fi
+
+        if [[ -n "$value" ]]; then
+            if [[ "$label" != "Database password" ]]; then
+                printf '%s: %s\n' "$label" "$value" >&2
+                printf -v "$value_name_ref" '%s' "$value"
+            fi
+            printf -v "$var_name_ref" '%s' "$default_var"
+            return 0
+        fi
+
+        if [[ -n "$BACKUP_ENV_FILE" ]]; then
+            warning "${default_var} was not found in:"
+            warning "$BACKUP_ENV_FILE"
+        else
+            warning "No environment file is configured."
+        fi
+
+        action="$(
+            select_option \
+                "${label}:" \
+                "Enter ${label} manually" \
+                "Enter another variable name" \
+                "Choose another env file" \
+                "Cancel"
+        )" || return 1
+
+        case "$action" in
+            "Enter ${label} manually")
+                if [[ "$label" == "Database password" ]]; then
+                    BACKUP_RUNTIME_PASSWORD="$(read_secret "$label")" || return 1
+                    BACKUP_CREDENTIAL_SOURCE="prompt"
+                    printf -v "$value_name_ref" ''
+                else
+                    value="$(ask_required_input "$label")" || return 1
+                    printf -v "$value_name_ref" '%s' "$value"
+                fi
+                return 0
+                ;;
+            "Enter another variable name")
+                default_var="$(ask_required_input "${label} env var")" || return 1
+                ;;
+            "Choose another env file")
+                BACKUP_ENV_FILE="$(prompt_manual_env_file "${DOCKER_PROJECT_DIR:-$(pwd)}")" || return 1
+                ;;
+            "Cancel")
+                return 1
+                ;;
+        esac
+    done
+}
+
+resolve_password_env_value() {
+    local default_var="$BACKUP_DB_PASSWORD_VAR"
+    local action
+
+    while true; do
+        if [[ -n "$BACKUP_ENV_FILE" && -n "$default_var" ]] &&
+           env_file_value "$BACKUP_ENV_FILE" "$default_var" >/dev/null 2>&1; then
+            BACKUP_DB_PASSWORD_VAR="$default_var"
+            return 0
+        fi
+
+        if [[ -n "$BACKUP_ENV_FILE" ]]; then
+            warning "${default_var} was not found in:"
+            warning "$BACKUP_ENV_FILE"
+        else
+            warning "No environment file is configured."
+        fi
+
+        action="$(
+            select_option \
+                "Database password:" \
+                "Prompt securely now" \
+                "Enter another variable name" \
+                "Choose another env file" \
+                "Cancel"
+        )" || return 1
+
+        case "$action" in
+            "Prompt securely now")
+                BACKUP_RUNTIME_PASSWORD="$(read_secret "Database password")" || return 1
+                BACKUP_CREDENTIAL_SOURCE="prompt"
+                return 0
+                ;;
+            "Enter another variable name")
+                default_var="$(ask_required_input "Database password env var")" || return 1
+                ;;
+            "Choose another env file")
+                BACKUP_ENV_FILE="$(prompt_manual_env_file "${DOCKER_PROJECT_DIR:-$(pwd)}")" || return 1
+                ;;
+            "Cancel")
+                return 1
+                ;;
+        esac
+    done
+}
+
+ensure_native_backup_client() {
+    local db_type="$1"
+    local package=""
+    local missing_label
+
+    case "$db_type" in
+        postgres)
+            command_exists pg_dump && return 0
+            package="postgresql-client"
+            missing_label="PostgreSQL backup client (pg_dump)"
+            ;;
+        mysql)
+            command_exists mysqldump && return 0
+            package="default-mysql-client"
+            missing_label="MySQL backup client (mysqldump)"
+            ;;
+        mariadb)
+            { command_exists mariadb-dump || command_exists mysqldump; } && return 0
+            package="mariadb-client"
+            missing_label="MariaDB backup client (mariadb-dump or mysqldump)"
+            ;;
+    esac
+
+    error "${missing_label} is not installed."
+    if [[ "$BACKUP_CRON_MODE" -eq 1 ]]; then
+        return 1
+    fi
+
+    if confirm "Install ${missing_label} tools now?" "yes"; then
+        apt update
+        apt install -y "$package"
+    else
+        return 1
+    fi
+
+    case "$db_type" in
+        postgres) command_exists pg_dump ;;
+        mysql) command_exists mysqldump ;;
+        mariadb) command_exists mariadb-dump || command_exists mysqldump ;;
+    esac
+}
+
+preflight_docker_client() {
+    local db_type="$1"
+    local service="$BACKUP_DB_SERVICE"
+    local action
+
+    if docker_service_has_client "$service" "$db_type"; then
+        return 0
+    fi
+
+    error "$(backup_client_name "$db_type") is not available in service: ${service}"
+    error "This service does not appear to be a $(db_engine_label "$db_type") database backup target."
+
+    if [[ "$BACKUP_CRON_MODE" -eq 1 ]]; then
+        return 1
+    fi
+
+    action="$(
+        select_option \
+            "Database execution:" \
+            "Select another Compose service" \
+            "Configure native/external database" \
+            "Cancel"
+    )" || return 1
+
+    case "$action" in
+        "Select another Compose service")
+            BACKUP_DB_SERVICE="$(select_compose_service)" || return 1
+            preflight_docker_client "$db_type"
+            ;;
+        "Configure native/external database")
+            collect_native_database_config
+            ;;
+        "Cancel")
+            return 1
+            ;;
+    esac
+}
+
+preflight_postgres() {
+    local password
+
+    if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
+        preflight_docker_client postgres || return 1
+        if compose_exec exec -T "$BACKUP_DB_SERVICE" sh -c 'command -v pg_isready >/dev/null 2>&1'; then
+            compose_exec exec -T "$BACKUP_DB_SERVICE" pg_isready >/dev/null 2>&1 || true
+        fi
+        return 0
+    fi
+
+    ensure_native_backup_client postgres || return 1
+    info "Checking PostgreSQL connection..."
+    if command_exists pg_isready && pg_isready -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" >/dev/null 2>&1; then
+        success "PostgreSQL is reachable."
+        return 0
+    fi
+
+    password="$(backup_password_env_prefix)"
+    if command_exists psql; then
+        if [[ -n "$password" ]]; then
+            PGPASSWORD="$password" psql -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null 2>&1 && {
+                success "PostgreSQL is reachable."
+                return 0
+            }
+        else
+            psql -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null 2>&1 && {
+                success "PostgreSQL is reachable."
+                return 0
+            }
+        fi
+    fi
+
+    error "PostgreSQL is not reachable."
+    printf 'Host: %s\nPort: %s\nDatabase: %s\n' "$BACKUP_DB_HOST" "$BACKUP_DB_PORT" "$BACKUP_DB_NAME" >&2
+    [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
+    preflight_failure_action
+}
+
+preflight_mysql_like() {
+    local db_type="$1"
+    local client="mysql"
+    local password
+
+    if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
+        preflight_docker_client "$db_type" || return 1
+        return 0
+    fi
+
+    ensure_native_backup_client "$db_type" || return 1
+    command_exists mariadb && client="mariadb"
+    command_exists mysql && client="mysql"
+
+    info "Checking $(db_engine_label "$db_type") connection..."
+    password="$(backup_password_env_prefix)"
+    if [[ -n "$password" ]]; then
+        MYSQL_PWD="$password" "$client" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" -e 'select 1' >/dev/null 2>&1 && {
+            success "$(db_engine_label "$db_type") is reachable."
+            return 0
+        }
+    else
+        "$client" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" -e 'select 1' >/dev/null 2>&1 && {
+            success "$(db_engine_label "$db_type") is reachable."
+            return 0
+        }
+    fi
+
+    error "$(db_engine_label "$db_type") is not reachable."
+    printf 'Host: %s\nPort: %s\nDatabase: %s\n' "$BACKUP_DB_HOST" "$BACKUP_DB_PORT" "$BACKUP_DB_NAME" >&2
+    [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
+    preflight_failure_action
+}
+
+preflight_mysql() {
+    preflight_mysql_like mysql
+}
+
+preflight_mariadb() {
+    preflight_mysql_like mariadb
+}
+
+preflight_failure_action() {
+    local action
+
+    action="$(
+        select_option \
+            "Connection preflight:" \
+            "Edit database configuration" \
+            "Continue anyway" \
+            "Cancel"
+    )" || return 1
+
+    case "$action" in
+        "Edit database configuration")
+            if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
+                collect_docker_database_config
+            else
+                collect_native_database_config
+            fi
+            ;;
+        "Continue anyway")
+            return 0
+            ;;
+        "Cancel")
+            return 1
+            ;;
+    esac
+}
+
+show_preflight_summary() {
+    echo
+    echo "Database Preflight"
+    echo
+    printf 'Source: %s\n' "$BACKUP_SOURCE_MODE"
+    printf 'Engine: %s\n' "$(db_engine_label "$BACKUP_DB_TYPE")"
+    if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
+        printf 'Execution service: %s\n' "$BACKUP_DB_SERVICE"
+    else
+        printf 'Host: %s\n' "$BACKUP_DB_HOST"
+        printf 'Port: %s\n' "$BACKUP_DB_PORT"
+    fi
+    printf 'Database: %s\n' "$BACKUP_DB_NAME"
+    printf 'User: %s\n' "$BACKUP_DB_USER"
+    printf 'Backup client: %s available\n' "$(backup_client_name "$BACKUP_DB_TYPE")"
+    printf 'Connection: reachable or deferred\n'
+    echo
+    success "Database is ready for backup."
+}
+
+preflight_database_config() {
+    backup_resolve_runtime_values || return 1
+
+    case "$BACKUP_DB_TYPE" in
+        postgres) preflight_postgres || return 1 ;;
+        mysql) preflight_mysql || return 1 ;;
+        mariadb) preflight_mariadb || return 1 ;;
+    esac
+
+    show_preflight_summary
+    BACKUP_PREFLIGHT_DONE=1
 }
 
 collect_docker_database_config() {
@@ -488,13 +905,11 @@ collect_docker_database_config() {
     BACKUP_DB_PASSWORD_VAR="$(ask_input "Database password env var" "DB_PASSWORD")" || return 1
     BACKUP_CREDENTIAL_SOURCE="env"
 
-    if [[ -n "$BACKUP_ENV_FILE" ]]; then
-        BACKUP_DB_NAME="$(env_file_value "$BACKUP_ENV_FILE" "$BACKUP_DB_NAME_VAR" || true)"
-        BACKUP_DB_USER="$(env_file_value "$BACKUP_ENV_FILE" "$BACKUP_DB_USER_VAR" || true)"
-    fi
+    resolve_required_env_value "Database" BACKUP_DB_NAME_VAR BACKUP_DB_NAME || return 1
+    resolve_required_env_value "Database user" BACKUP_DB_USER_VAR BACKUP_DB_USER || return 1
+    resolve_password_env_value || return 1
 
-    [[ -n "$BACKUP_DB_NAME" ]] || BACKUP_DB_NAME="$(ask_input "Database name")" || return 1
-    [[ -n "$BACKUP_DB_USER" ]] || BACKUP_DB_USER="$(ask_input "Database user")" || return 1
+    preflight_database_config || return 1
 }
 
 detect_native_db_types() {
@@ -509,7 +924,7 @@ collect_native_database_config() {
     BACKUP_SOURCE_MODE="native"
     while IFS= read -r type; do
         [[ -n "$type" ]] && detected+=("$type")
-    done < <(detect_native_db_types | awk '!seen[$0]++')
+    done < <(detect_native_db_types | awk '!seen[$0]++' || true)
 
     if [[ "${#detected[@]}" -eq 1 ]]; then
         BACKUP_DB_TYPE="${detected[0]}"
@@ -526,8 +941,8 @@ collect_native_database_config() {
         mysql|mariadb) BACKUP_DB_PORT="$(ask_input "Port" "3306")" ;;
     esac
     BACKUP_DB_HOST="$(ask_input "Host" "127.0.0.1")" || return 1
-    BACKUP_DB_NAME="$(ask_input "Database")" || return 1
-    BACKUP_DB_USER="$(ask_input "Username")" || return 1
+    BACKUP_DB_NAME="$(ask_required_input "Database")" || return 1
+    BACKUP_DB_USER="$(ask_required_input "Username")" || return 1
 
     local cred_choice
     cred_choice="$(
@@ -552,6 +967,8 @@ collect_native_database_config() {
             BACKUP_CREDENTIAL_SOURCE="prompt"
             ;;
     esac
+
+    preflight_database_config || return 1
 }
 
 ensure_rclone_available_for_backup() {
@@ -574,6 +991,39 @@ ensure_rclone_available_for_backup() {
     fi
 }
 
+run_rclone_config_for_backup() {
+    local rc
+
+    echo
+    echo "hostctl will now open rclone's interactive configuration utility."
+    echo
+    echo "Complete the remote setup, then choose \"q\" inside rclone to return to hostctl."
+    echo
+
+    if ! confirm "Continue?" "yes"; then
+        return 1
+    fi
+
+    set +e
+    rclone config
+    rc=$?
+    set -e
+    if [[ "$rc" -ne 0 ]]; then
+        warning "rclone configuration exited with status ${rc}."
+        return "$rc"
+    fi
+
+    info "Returned from rclone configuration."
+}
+
+load_rclone_remotes() {
+    local remote
+
+    while IFS= read -r remote; do
+        [[ -n "$remote" ]] && printf '%s\n' "$remote"
+    done < <(rclone listremotes 2>/dev/null || true)
+}
+
 select_rclone_remote() {
     local remotes=()
     local remote
@@ -581,18 +1031,41 @@ select_rclone_remote() {
 
     ensure_rclone_available_for_backup || return 1
     while IFS= read -r remote; do
-        [[ -n "$remote" ]] && remotes+=("$remote")
-    done < <(rclone listremotes 2>/dev/null || true)
+        remotes+=("$remote")
+    done < <(load_rclone_remotes)
 
     if [[ "${#remotes[@]}" -eq 0 ]]; then
-        if confirm "Configure rclone now?" "yes"; then
-            rclone config
-        else
-            return 1
-        fi
-        while IFS= read -r remote; do
-            [[ -n "$remote" ]] && remotes+=("$remote")
-        done < <(rclone listremotes 2>/dev/null || true)
+        while true; do
+            if confirm "Configure rclone now?" "yes"; then
+                run_rclone_config_for_backup || return 1
+            else
+                return 1
+            fi
+
+            remotes=()
+            while IFS= read -r remote; do
+                remotes+=("$remote")
+            done < <(load_rclone_remotes)
+            [[ "${#remotes[@]}" -gt 0 ]] && break
+
+            warning "No rclone remote was created."
+            choice="$(
+                select_option \
+                    "rclone remote:" \
+                    "Open rclone config again" \
+                    "Continue with Local backup instead" \
+                    "Cancel"
+            )" || return 1
+            case "$choice" in
+                "Open rclone config again") continue ;;
+                "Continue with Local backup instead")
+                    BACKUP_DESTINATION="local"
+                    printf '\n'
+                    return 1
+                    ;;
+                "Cancel") return 1 ;;
+            esac
+        done
     fi
 
     echo "Remote destination:" >&2
@@ -615,7 +1088,7 @@ select_rclone_remote() {
                 printf '%s\n' "${remotes[$((choice - 1))]}"
                 return 0
             elif (( choice == ${#remotes[@]} + 1 )); then
-                rclone config
+                run_rclone_config_for_backup || return 1
                 select_rclone_remote
                 return
             elif (( choice == ${#remotes[@]} + 2 )); then
@@ -654,7 +1127,14 @@ collect_destination_config() {
     fi
 
     if [[ "$BACKUP_DESTINATION" == "remote" || "$BACKUP_DESTINATION" == "both" ]]; then
-        BACKUP_RCLONE_REMOTE="$(select_rclone_remote)" || return 1
+        if ! BACKUP_RCLONE_REMOTE="$(select_rclone_remote)"; then
+            if [[ "$BACKUP_DESTINATION" == "local" ]]; then
+                BACKUP_RCLONE_REMOTE=""
+                BACKUP_RCLONE_PATH=""
+                return 0
+            fi
+            return 1
+        fi
         BACKUP_RCLONE_PATH="$(ask_input "Remote backup path" "hostctl/backups/${default_profile}")" || return 1
     fi
 }
@@ -744,6 +1224,34 @@ backup_password_env_prefix() {
     fi
 }
 
+run_dump_command_to_file() {
+    local failure_label="$1"
+    local output_file="$2"
+    shift 2
+    local error_file
+    local rc
+
+    error_file="$(mktemp)"
+    set +e
+    "$@" > "$output_file" 2>"$error_file"
+    rc=$?
+    set -e
+
+    if [[ "$rc" -ne 0 ]]; then
+        if [[ -s "$error_file" ]]; then
+            cat "$error_file" >&2
+        fi
+        error "$failure_label failed."
+        info "No valid backup file was created."
+        BACKUP_LAST_ERROR="$failure_label failed"
+        rm -f "$error_file"
+        return "$rc"
+    fi
+
+    rm -f "$error_file"
+    return 0
+}
+
 docker_dump_database_to_sql() {
     local sql_file="$1"
     local password
@@ -753,22 +1261,26 @@ docker_dump_database_to_sql() {
             info "Creating PostgreSQL dump..."
             password="$(backup_password_env_prefix)"
             if [[ -n "$password" ]]; then
-                compose_exec exec -T -e "PGPASSWORD=${password}" "$BACKUP_DB_SERVICE" \
-                    pg_dump -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME" > "$sql_file"
+                run_dump_command_to_file "PostgreSQL backup" "$sql_file" \
+                    compose_exec exec -T -e "PGPASSWORD=${password}" "$BACKUP_DB_SERVICE" \
+                    pg_dump -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             else
-                compose_exec exec -T "$BACKUP_DB_SERVICE" \
-                    pg_dump -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME" > "$sql_file"
+                run_dump_command_to_file "PostgreSQL backup" "$sql_file" \
+                    compose_exec exec -T "$BACKUP_DB_SERVICE" \
+                    pg_dump -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             fi
             ;;
         mysql|mariadb)
             info "Creating MySQL/MariaDB dump..."
             password="$(backup_password_env_prefix)"
             if [[ -n "$password" ]]; then
-                compose_exec exec -T -e "MYSQL_PWD=${password}" "$BACKUP_DB_SERVICE" \
-                    sh -c "command -v mariadb-dump >/dev/null 2>&1 && exec mariadb-dump --no-tablespaces -u \"\$1\" \"\$2\" || exec mysqldump --no-tablespaces -u \"\$1\" \"\$2\"" sh "$BACKUP_DB_USER" "$BACKUP_DB_NAME" > "$sql_file"
+                run_dump_command_to_file "MySQL/MariaDB backup" "$sql_file" \
+                    compose_exec exec -T -e "MYSQL_PWD=${password}" "$BACKUP_DB_SERVICE" \
+                    sh -c "command -v mariadb-dump >/dev/null 2>&1 && exec mariadb-dump --no-tablespaces -u \"\$1\" \"\$2\" || exec mysqldump --no-tablespaces -u \"\$1\" \"\$2\"" sh "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             else
-                compose_exec exec -T "$BACKUP_DB_SERVICE" \
-                    sh -c "command -v mariadb-dump >/dev/null 2>&1 && exec mariadb-dump --no-tablespaces -u \"\$1\" \"\$2\" || exec mysqldump --no-tablespaces -u \"\$1\" \"\$2\"" sh "$BACKUP_DB_USER" "$BACKUP_DB_NAME" > "$sql_file"
+                run_dump_command_to_file "MySQL/MariaDB backup" "$sql_file" \
+                    compose_exec exec -T "$BACKUP_DB_SERVICE" \
+                    sh -c "command -v mariadb-dump >/dev/null 2>&1 && exec mariadb-dump --no-tablespaces -u \"\$1\" \"\$2\" || exec mysqldump --no-tablespaces -u \"\$1\" \"\$2\"" sh "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             fi
             ;;
     esac
@@ -785,9 +1297,11 @@ native_dump_database_to_sql() {
             info "Creating PostgreSQL dump..."
             password="$(backup_password_env_prefix)"
             if [[ -n "$password" ]]; then
-                PGPASSWORD="$password" pg_dump -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME" > "$sql_file"
+                run_dump_command_to_file "PostgreSQL backup" "$sql_file" \
+                    env "PGPASSWORD=${password}" pg_dump -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             else
-                pg_dump -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME" > "$sql_file"
+                run_dump_command_to_file "PostgreSQL backup" "$sql_file" \
+                    pg_dump -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             fi
             ;;
         mysql|mariadb)
@@ -802,9 +1316,11 @@ native_dump_database_to_sql() {
             info "Creating MySQL/MariaDB dump..."
             password="$(backup_password_env_prefix)"
             if [[ -n "$password" ]]; then
-                MYSQL_PWD="$password" "$dump_cmd" --no-tablespaces -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" > "$sql_file"
+                run_dump_command_to_file "MySQL/MariaDB backup" "$sql_file" \
+                    env "MYSQL_PWD=${password}" "$dump_cmd" --no-tablespaces -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             else
-                "$dump_cmd" --no-tablespaces -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" > "$sql_file"
+                run_dump_command_to_file "MySQL/MariaDB backup" "$sql_file" \
+                    "$dump_cmd" --no-tablespaces -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             fi
             ;;
     esac
@@ -928,6 +1444,9 @@ run_database_backup() {
 
     ensure_backup_dirs
     backup_resolve_runtime_values || return 1
+    if [[ "${BACKUP_PREFLIGHT_DONE:-0}" -ne 1 ]]; then
+        preflight_database_config || return 1
+    fi
 
     case "$BACKUP_DESTINATION" in
         local) local_required="yes" ;;
@@ -947,6 +1466,7 @@ run_database_backup() {
         BACKUP_LAST_RESULT="Failed"
         BACKUP_LAST_ERROR="BACKUP FAILED"
         [[ "$profile" != "one-time" ]] && write_backup_run_state "$profile"
+        backup_failure_summary "${BACKUP_LAST_ERROR:-BACKUP FAILED}"
         return 1
     fi
 
@@ -994,6 +1514,28 @@ run_database_backup() {
 
     [[ "$profile" != "one-time" ]] && write_backup_run_state "$profile"
     return "$exit_code"
+}
+
+backup_failure_summary() {
+    local reason="$1"
+
+    echo
+    echo "Backup Failed"
+    echo
+    printf 'Source: %s\n' "$BACKUP_SOURCE_MODE"
+    printf 'Engine: %s\n' "$(db_engine_label "$BACKUP_DB_TYPE")"
+    if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
+        printf 'Service: %s\n' "$BACKUP_DB_SERVICE"
+    else
+        printf 'Host: %s\n' "$BACKUP_DB_HOST"
+        printf 'Port: %s\n' "$BACKUP_DB_PORT"
+    fi
+    printf 'Database: %s\n' "$BACKUP_DB_NAME"
+    echo
+    echo "Reason:"
+    printf '%s\n' "$reason"
+    echo
+    echo "No backup was created."
 }
 
 with_backup_lock() {
@@ -1251,9 +1793,14 @@ schedule_backup_profile() {
 
 run_profile_now() {
     local profile="$1"
+    local status=0
 
     load_backup_profile "$profile" || return 1
-    with_backup_lock "$profile" run_database_backup "$profile"
+    with_backup_lock "$profile" run_database_backup "$profile" || status=$?
+    if [[ "$BACKUP_CRON_MODE" -eq 1 ]]; then
+        return "$status"
+    fi
+    return 0
 }
 
 show_backup_status_for_profile() {
@@ -1481,8 +2028,11 @@ cmd_backup_now() {
 
     if [[ -n "$BACKUP_PROFILE_NAME" ]]; then
         load_backup_profile "$BACKUP_PROFILE_NAME" || return 1
-        with_backup_lock "$BACKUP_PROFILE_NAME" run_database_backup "$BACKUP_PROFILE_NAME"
-        return
+        with_backup_lock "$BACKUP_PROFILE_NAME" run_database_backup "$BACKUP_PROFILE_NAME" || save_status=$?
+        if [[ "$BACKUP_CRON_MODE" -eq 1 ]]; then
+            return "$save_status"
+        fi
+        return 0
     fi
 
     collect_backup_config || return 0
@@ -1499,7 +2049,10 @@ cmd_backup_now() {
         fi
     fi
 
-    return "$save_status"
+    if [[ "$BACKUP_CRON_MODE" -eq 1 ]]; then
+        return "$save_status"
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------
