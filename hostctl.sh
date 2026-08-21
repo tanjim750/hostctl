@@ -9,6 +9,11 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 COMMON_LIB="${SCRIPT_DIR}/lib/common.sh"
+INIT_LIB="${SCRIPT_DIR}/lib/init.sh"
+
+# ---------------------------------------------------------
+# Load required libraries
+# ---------------------------------------------------------
 
 if [[ ! -f "$COMMON_LIB" ]]; then
     echo "[ERROR] Missing required library: $COMMON_LIB" >&2
@@ -17,6 +22,13 @@ fi
 
 # shellcheck source=lib/common.sh
 source "$COMMON_LIB"
+
+if [[ ! -f "$INIT_LIB" ]]; then
+    die "Missing required library: $INIT_LIB"
+fi
+
+# shellcheck source=lib/init.sh
+source "$INIT_LIB"
 
 # ---------------------------------------------------------
 # Help
@@ -88,6 +100,11 @@ Cron:
   --cron-list              List hostctl cron jobs
   --cron-remove            Remove cron job
 
+Security:
+  --fail2ban               Configure Fail2Ban
+  --ssh-security           Configure SSH security
+  --security-status        Show security status
+
 Monitoring:
   --monitor                Show resource monitor
   --service-status         Show service status
@@ -108,9 +125,10 @@ EOF
 on_error() {
     local exit_code=$?
     local line_no="${BASH_LINENO[0]:-unknown}"
+    local failed_command="${1:-unknown}"
 
     error "Command failed at line ${line_no} with exit code ${exit_code}."
-    log_event "ERROR exit=${exit_code} line=${line_no} command=${1:-unknown}"
+    log_event "ERROR exit=${exit_code} line=${line_no} command=${failed_command}"
 
     exit "$exit_code"
 }
@@ -129,12 +147,13 @@ fi
 COMMAND="$1"
 shift || true
 
-# Help/version do not require root.
+# Help and version do not require root.
 case "$COMMAND" in
     --help|-h)
         show_help
         exit 0
         ;;
+
     --version|-v)
         printf 'hostctl %s\n' "$HOSTCTL_VERSION"
         exit 0
@@ -152,8 +171,10 @@ log_event "COMMAND ${COMMAND} args=$* cwd=$(pwd)"
 # ---------------------------------------------------------
 
 case "$COMMAND" in
+
+    # Core
     --init)
-        die "--init is not implemented yet."
+        cmd_init "$@"
         ;;
 
     --status)
@@ -164,6 +185,7 @@ case "$COMMAND" in
         die "--health is not implemented yet."
         ;;
 
+    # System
     --update)
         die "--update is not implemented yet."
         ;;
@@ -176,50 +198,95 @@ case "$COMMAND" in
         die "--cleanup is not implemented yet."
         ;;
 
-    --docker|--docker-status|--docker-build|--docker-start|--docker-stop|\
-    --docker-restart|--docker-rebuild|--docker-down|--docker-pull|\
-    --docker-logs|--docker-logs-clear|--docker-ps)
+    --security)
+        die "--security is not implemented yet."
+        ;;
+
+    # Docker
+    --docker|\
+    --docker-status|\
+    --docker-build|\
+    --docker-start|\
+    --docker-stop|\
+    --docker-restart|\
+    --docker-rebuild|\
+    --docker-down|\
+    --docker-pull|\
+    --docker-logs|\
+    --docker-logs-clear|\
+    --docker-ps)
         die "${COMMAND} is not implemented yet."
         ;;
 
-    --nginx|--domain|--nginx-security|--nginx-rate-limit|\
-    --nginx-block-ip|--nginx-whitelist-ip|--nginx-logs|\
+    # Nginx
+    --nginx|\
+    --domain|\
+    --nginx-security|\
+    --nginx-rate-limit|\
+    --nginx-block-ip|\
+    --nginx-whitelist-ip|\
+    --nginx-logs|\
     --nginx-logs-clear)
         die "${COMMAND} is not implemented yet."
         ;;
 
+    # SSL
     --ssl|--ssl-status)
         die "${COMMAND} is not implemented yet."
         ;;
 
-    --firewall|--allow-port|--deny-port|--firewall-status|--firewall-reset)
+    # Firewall
+    --firewall|\
+    --allow-port|\
+    --deny-port|\
+    --firewall-status|\
+    --firewall-reset)
         die "${COMMAND} is not implemented yet."
         ;;
 
-    --db-backup|--db-restore|--backup-now|--backup-schedule|--backup-status)
+    # Database / Backup
+    --db-backup|\
+    --db-restore|\
+    --backup-now|\
+    --backup-schedule|\
+    --backup-status)
         die "${COMMAND} is not implemented yet."
         ;;
 
+    # rclone
     --rclone)
         die "--rclone is not implemented yet."
         ;;
 
-    --cronjob|--cron-list|--cron-remove)
+    # Cron
+    --cronjob|\
+    --cron-list|\
+    --cron-remove)
         die "${COMMAND} is not implemented yet."
         ;;
 
-    --security|--fail2ban|--ssh-security|--security-status)
+    # Security
+    --fail2ban|\
+    --ssh-security|\
+    --security-status)
         die "${COMMAND} is not implemented yet."
         ;;
 
-    --monitor|--service-status)
+    # Monitoring
+    --monitor|\
+    --service-status)
         die "${COMMAND} is not implemented yet."
         ;;
 
-    --logs|--logs-clear|--log-status|--system-logs)
+    # Logs
+    --logs|\
+    --logs-clear|\
+    --log-status|\
+    --system-logs)
         die "${COMMAND} is not implemented yet."
         ;;
 
+    # Unknown
     *)
         error "Unknown command: $COMMAND"
         echo
