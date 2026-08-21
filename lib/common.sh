@@ -119,10 +119,30 @@ ask_input() {
     local value
 
     if [[ -n "$default_value" ]]; then
-        read -r -p "$prompt [$default_value]: " value
+        if [[ -r /dev/tty ]]; then
+            read -r -p "$prompt [$default_value]: " value </dev/tty || {
+                error "Unable to read interactive input."
+                return 1
+            }
+        else
+            read -r -p "$prompt [$default_value]: " value || {
+                error "Unable to read interactive input."
+                return 1
+            }
+        fi
         printf '%s\n' "${value:-$default_value}"
     else
-        read -r -p "$prompt: " value
+        if [[ -r /dev/tty ]]; then
+            read -r -p "$prompt: " value </dev/tty || {
+                error "Unable to read interactive input."
+                return 1
+            }
+        else
+            read -r -p "$prompt: " value || {
+                error "Unable to read interactive input."
+                return 1
+            }
+        fi
         printf '%s\n' "$value"
     fi
 }
@@ -134,10 +154,30 @@ confirm() {
 
     while true; do
         if [[ "$default" == "yes" ]]; then
-            read -r -p "$prompt [Y/n]: " answer
+            if [[ -r /dev/tty ]]; then
+                read -r -p "$prompt [Y/n]: " answer </dev/tty || {
+                    error "Unable to read interactive input."
+                    return 1
+                }
+            else
+                read -r -p "$prompt [Y/n]: " answer || {
+                    error "Unable to read interactive input."
+                    return 1
+                }
+            fi
             answer="${answer:-y}"
         else
-            read -r -p "$prompt [y/N]: " answer
+            if [[ -r /dev/tty ]]; then
+                read -r -p "$prompt [y/N]: " answer </dev/tty || {
+                    error "Unable to read interactive input."
+                    return 1
+                }
+            else
+                read -r -p "$prompt [y/N]: " answer || {
+                    error "Unable to read interactive input."
+                    return 1
+                }
+            fi
             answer="${answer:-n}"
         fi
 
@@ -174,7 +214,17 @@ select_option() {
     done
 
     while true; do
-        read -r -p "Select [1-${#options[@]}]: " choice
+        if [[ -r /dev/tty ]]; then
+            read -r -p "Select [1-${#options[@]}]: " choice </dev/tty || {
+                error "Unable to read interactive input."
+                return 1
+            }
+        else
+            read -r -p "Select [1-${#options[@]}]: " choice || {
+                error "Unable to read interactive input."
+                return 1
+            }
+        fi
 
         if [[ "$choice" =~ ^[0-9]+$ ]] &&
            (( choice >= 1 && choice <= ${#options[@]} )); then

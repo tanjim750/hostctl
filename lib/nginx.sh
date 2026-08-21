@@ -35,6 +35,11 @@ RULE_RATE=""
 RULE_BURST=""
 RULE_ZONE=""
 RULE_MODE=""
+PREPARED_ACCESS_TARGET=""
+PREPARED_ACCESS_ACCEPTED_DOMAINS=""
+PREPARED_ACCESS_SKIPPED_DOMAINS=""
+HOSTCTL_AUTHORIZED_NGINX_CONFIGS=""
+HOSTCTL_SKIPPED_NGINX_CONFIGS=""
 
 # ---------------------------------------------------------
 # Common helpers
@@ -361,6 +366,7 @@ extract_domains_from_config_dir() {
         files+=("$file")
     done < <(find "$dir" -maxdepth 1 \( -type f -o -type l \) -print)
 
+    [[ "${#files[@]}" -eq 0 ]] && return 0
     for file in "${files[@]}"; do
         is_ignored_nginx_config_path "$file" && continue
         if [[ -L "$file" ]]; then
@@ -413,7 +419,17 @@ select_nginx_domain() {
     fi
 
     while true; do
-        read -r -p "Select [1-${max_choice}]: " choice
+        if [[ -r /dev/tty ]]; then
+            read -r -p "Select [1-${max_choice}]: " choice </dev/tty || {
+                error "Unable to read interactive input."
+                return 1
+            }
+        else
+            read -r -p "Select [1-${max_choice}]: " choice || {
+                error "Unable to read interactive input."
+                return 1
+            }
+        fi
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= max_choice )); then
             if [[ "$allow_new" == "yes" && "$choice" -eq "$max_choice" ]]; then
                 while true; do
@@ -491,6 +507,7 @@ find_enabled_domain_owner() {
         enabled_files+=("$enabled")
     done < <(find "$NGINX_SITES_ENABLED" -maxdepth 1 \( -type f -o -type l \) -print)
 
+    [[ "${#enabled_files[@]}" -eq 0 ]] && return 0
     for enabled in "${enabled_files[@]}"; do
         is_ignored_nginx_config_path "$enabled" && continue
         resolved="$(real_config_path "$enabled" 2>/dev/null || true)"
@@ -2350,7 +2367,17 @@ select_managed_rule() {
     count="$(wc -l <<< "$records" | tr -d '[:space:]')"
 
     while true; do
-        read -r -p "Select [1-${count}]: " choice
+        if [[ -r /dev/tty ]]; then
+            read -r -p "Select [1-${count}]: " choice </dev/tty || {
+                error "Unable to read interactive input."
+                return 1
+            }
+        else
+            read -r -p "Select [1-${count}]: " choice || {
+                error "Unable to read interactive input."
+                return 1
+            }
+        fi
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= count )); then
             sed -n "${choice}p" <<< "$records"
             return 0
@@ -2393,6 +2420,84 @@ assert_single_enabled_domain_owner() {
     return 0
 }
 
+path_list_contains() {
+    local list="$1"
+    local item="$2"
+    local existing
+
+    while IFS= read -r existing; do
+        [[ "$existing" == "$item" ]] && return 0
+    done <<< "$list"
+
+    return 1
+}
+
+append_unique_path_var() {
+    local var_name="$1"
+    local item="$2"
+    local current
+
+    eval "current=\"\${${var_name}:-}\""
+    path_list_contains "$current" "$item" && return 0
+    if [[ -n "$current" ]]; then
+        eval "${var_name}=\"\${current}\"$'\\n'\"\${item}\""
+    else
+        eval "${var_name}=\"\${item}\""
+    fi
+}
+
+authorize_nginx_config_modification() {
+    local file="$1"
+    local choice
+
+    grep -q 'Managed by hostctl' "$file" && return 0
+    path_list_contains "$HOSTCTL_AUTHORIZED_NGINX_CONFIGS" "$file" && return 0
+    path_list_contains "$HOSTCTL_SKIPPED_NGINX_CONFIGS" "$file" && return 2
+
+    echo >&2
+    warning "This configuration was not created by hostctl:"
+    printf '%s\n' "$file" >&2
+    echo >&2
+
+    printf '%s\n' "Modify non-hostctl config:" >&2
+    printf '1. Backup and allow hostctl to modify it\n' >&2
+    printf '2. Skip this configuration\n' >&2
+    printf '3. Cancel\n' >&2
+
+    while true; do
+        if [[ -r /dev/tty ]]; then
+            read -r -p "Select [1-3]: " choice </dev/tty || {
+                error "Unable to read interactive input."
+                return 3
+            }
+        else
+            read -r -p "Select [1-3]: " choice || {
+                error "Unable to read interactive input."
+                return 3
+            }
+        fi
+
+        case "$choice" in
+            1)
+                append_unique_path_var HOSTCTL_AUTHORIZED_NGINX_CONFIGS "$file"
+                return 0
+                ;;
+            2)
+                append_unique_path_var HOSTCTL_SKIPPED_NGINX_CONFIGS "$file"
+                warning "Skipped non-hostctl configuration: ${file}"
+                return 2
+                ;;
+            3)
+                warning "Access rule update cancelled."
+                return 3
+                ;;
+            *)
+                warning "Invalid selection."
+                ;;
+        esac
+    done
+}
+
 ensure_location_include() {
     local target="$1"
     local include_path="$2"
@@ -2401,7 +2506,7 @@ ensure_location_include() {
     local backup=""
     local temp_file
     local awk_status=0
-    local action
+    local auth_status=0
 
     [[ -f "$target" ]] || return 1
     if grep -Fq "include ${include_path};" "$target"; then
@@ -2409,29 +2514,12 @@ ensure_location_include() {
     fi
 
     if ! grep -q 'Managed by hostctl' "$target"; then
-        echo
-        warning "This configuration was not created by hostctl:"
-        printf '%s\n' "$target" >&2
-        echo >&2
-        action="$(
-            select_option \
-                "Modify non-hostctl config:" \
-                "Backup and allow hostctl to modify it" \
-                "Skip this configuration" \
-                "Cancel"
-        )"
-
-        case "$action" in
-            "Backup and allow hostctl to modify it") ;;
-            "Skip this configuration")
-                warning "Skipped non-hostctl configuration: ${target}"
-                return 0
-                ;;
-            "Cancel")
-                warning "Access rule update cancelled."
-                return 1
-                ;;
-        esac
+        if authorize_nginx_config_modification "$target"; then
+            auth_status=0
+        else
+            auth_status=$?
+        fi
+        [[ "$auth_status" -eq 0 ]] || return "$auth_status"
     fi
 
     backup="$(backup_file "$target" || true)"
@@ -2494,13 +2582,37 @@ ensure_location_include() {
 
 ensure_domain_access_includes() {
     local domain="$1"
+    local mode="${2:-all}"
     local target
+    local status
 
     target="$(domain_config_for_rule_scope "$domain")" || return 1
     ensure_global_access_snippet
     ensure_domain_access_snippet "$domain"
-    ensure_location_include "$target" "$HOSTCTL_NGINX_GLOBAL_ACCESS_SNIPPET" "$domain" "no" || return 1
-    ensure_location_include "$target" "$(domain_access_snippet "$domain")" "$domain" "no" || return 1
+
+    if ensure_location_include "$target" "$HOSTCTL_NGINX_GLOBAL_ACCESS_SNIPPET" "$domain" "no"; then
+        status=0
+    else
+        status=$?
+    fi
+    case "$status" in
+        0) ;;
+        2|3) return "$status" ;;
+        *) return 1 ;;
+    esac
+
+    if [[ "$mode" == "domain" || "$mode" == "all" ]]; then
+        if ensure_location_include "$target" "$(domain_access_snippet "$domain")" "$domain" "no"; then
+            status=0
+        else
+            status=$?
+        fi
+        case "$status" in
+            0) ;;
+            2|3) return "$status" ;;
+            *) return 1 ;;
+        esac
+    fi
 }
 
 ensure_security_enforcement_includes() {
@@ -2545,16 +2657,62 @@ verify_security_enforcement() {
 ensure_global_access_includes() {
     local domain
     local records
+    local status
+    local accepted=()
+    local skipped=()
+    local item
 
     ensure_global_access_snippet
     records="$(detect_nginx_domains || true)"
-    [[ -z "$records" ]] && return 0
+    if [[ -z "$records" ]]; then
+        warning "No active Nginx domains were selected for global access rules."
+        return 2
+    fi
 
     while IFS= read -r domain; do
         [[ -n "$domain" ]] || continue
         domain_is_active "$domain" || continue
-        ensure_domain_access_includes "$domain" || return 1
+        if ensure_domain_access_includes "$domain" "global"; then
+            status=0
+        else
+            status=$?
+        fi
+        case "$status" in
+            0) accepted+=("$domain") ;;
+            2) skipped+=("$domain") ;;
+            3) return 3 ;;
+            *) return 1 ;;
+        esac
     done <<< "$records"
+
+    if [[ "${#accepted[@]}" -gt 0 ]]; then
+        PREPARED_ACCESS_ACCEPTED_DOMAINS="$(printf '%s\n' "${accepted[@]}")"
+    fi
+    if [[ "${#skipped[@]}" -gt 0 ]]; then
+        PREPARED_ACCESS_SKIPPED_DOMAINS="$(printf '%s\n' "${skipped[@]}")"
+    fi
+
+    if [[ "${#accepted[@]}" -eq 0 ]]; then
+        warning "No active Nginx domains were selected for global access rules."
+        return 2
+    fi
+
+    echo >&2
+    echo "Global access rule will apply to:" >&2
+    echo >&2
+    for item in "${accepted[@]}"; do
+        printf -- '- %s\n' "$item" >&2
+    done
+    if [[ "${#skipped[@]}" -gt 0 ]]; then
+        echo >&2
+        echo "Skipped:" >&2
+        echo >&2
+        for item in "${skipped[@]}"; do
+            printf -- '- %s\n' "$item" >&2
+        done
+    fi
+    echo >&2
+    confirm "Continue?" "yes" || return 3
 }
 
 apply_nginx_file_updates() {
@@ -2919,16 +3077,42 @@ warn_global_allow_only() {
 prepare_access_rule_target() {
     local scope="$1"
     local type="$2"
+    local status
 
+    PREPARED_ACCESS_TARGET=""
+    PREPARED_ACCESS_ACCEPTED_DOMAINS=""
+    PREPARED_ACCESS_SKIPPED_DOMAINS=""
     if [[ "$scope" == "global" ]]; then
-        ensure_global_access_snippet >&2
-        ensure_global_access_includes >&2 || return 1
+        ensure_global_access_snippet
+        if ensure_global_access_includes; then
+            status=0
+        else
+            status=$?
+        fi
+        case "$status" in
+            0) ;;
+            2|3) return "$status" ;;
+            *) return 1 ;;
+        esac
     else
-        ensure_domain_access_snippet "$scope" >&2
-        ensure_domain_access_includes "$scope" >&2 || return 1
+        ensure_domain_access_snippet "$scope"
+        if ensure_domain_access_includes "$scope" "domain"; then
+            status=0
+        else
+            status=$?
+        fi
+        case "$status" in
+            0) ;;
+            2)
+                return 2
+                ;;
+            3) return 3 ;;
+            *) return 1 ;;
+        esac
     fi
 
-    target_for_scope "$scope" "$type"
+    PREPARED_ACCESS_TARGET="$(target_for_scope "$scope" "$type")"
+    [[ -n "$PREPARED_ACCESS_TARGET" ]]
 }
 
 active_domain_includes_snippet() {
@@ -2965,7 +3149,11 @@ verify_access_rule_effective() {
 
     if [[ "$scope" == "global" ]]; then
         snippet="$HOSTCTL_NGINX_GLOBAL_ACCESS_SNIPPET"
-        domains="$(detect_nginx_domains || true)"
+        if [[ -n "$PREPARED_ACCESS_ACCEPTED_DOMAINS" ]]; then
+            domains="$PREPARED_ACCESS_ACCEPTED_DOMAINS"
+        else
+            domains="$(detect_nginx_domains || true)"
+        fi
         while IFS= read -r domain; do
             [[ -n "$domain" ]] || continue
             domain_is_active "$domain" || continue
@@ -3058,8 +3246,22 @@ add_block_ip_rule() {
     local directive
     local id
     local result
+    local prepare_status
 
-    target="$(prepare_access_rule_target "$scope" block)" || return 1
+    if prepare_access_rule_target "$scope" block; then
+        prepare_status=0
+    else
+        prepare_status=$?
+    fi
+    case "$prepare_status" in
+        0) target="$PREPARED_ACCESS_TARGET" ;;
+        2)
+            warning "Block rule was not created because the active domain configuration was skipped."
+            return 0
+            ;;
+        3) return 0 ;;
+        *) return 1 ;;
+    esac
     directive="deny ${value};"
     if [[ "$scope" == "global" ]]; then
         marker="# HOSTCTL:BLOCK-IP:BEGIN id=$(rule_id block "$value") scope=global value=${value}"
@@ -3088,6 +3290,7 @@ add_allow_ip_rule() {
     local temp_file
     local id
     local result
+    local prepare_status
 
     if [[ "$mode" == "allow-only" ]]; then
         if [[ "$scope" == "global" ]]; then
@@ -3097,7 +3300,22 @@ add_allow_ip_rule() {
             confirm "Continue?" "no" || return 0
         fi
     fi
-    target="$(prepare_access_rule_target "$scope" allow)" || return 1
+    if prepare_access_rule_target "$scope" allow; then
+        prepare_status=0
+    else
+        prepare_status=$?
+    fi
+    case "$prepare_status" in
+        0) target="$PREPARED_ACCESS_TARGET" ;;
+        2)
+            if [[ "$scope" != "global" ]]; then
+                warning "Whitelist rule was not created because the active domain configuration was skipped."
+            fi
+            return 0
+            ;;
+        3) return 0 ;;
+        *) return 1 ;;
+    esac
     directive="allow ${value};"
 
     if [[ "$scope" == "global" ]]; then
