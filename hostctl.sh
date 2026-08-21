@@ -13,6 +13,7 @@ COMMON_LIB="${SCRIPT_DIR}/lib/common.sh"
 INIT_LIB="${SCRIPT_DIR}/lib/init.sh"
 SYSTEM_LIB="${SCRIPT_DIR}/lib/system.sh"
 DOCKER_LIB="${SCRIPT_DIR}/lib/docker.sh"
+NGINX_LIB="${SCRIPT_DIR}/lib/nginx.sh"
 
 # ---------------------------------------------------------
 # Load required libraries
@@ -46,6 +47,13 @@ fi
 
 # shellcheck source=lib/docker.sh
 source "$DOCKER_LIB"
+
+if [[ ! -f "$NGINX_LIB" ]]; then
+    die "Missing required library: $NGINX_LIB"
+fi
+
+# shellcheck source=lib/nginx.sh
+source "$NGINX_LIB"
 
 # ---------------------------------------------------------
 # Help
@@ -269,15 +277,36 @@ case "$COMMAND" in
         ;;
 
     # Nginx
-    --nginx|\
-    --domain|\
-    --nginx-security|\
-    --nginx-rate-limit|\
-    --nginx-block-ip|\
-    --nginx-whitelist-ip|\
-    --nginx-logs|\
+    --nginx)
+        cmd_nginx "$@"
+        ;;
+
+    --domain)
+        cmd_domain "$@"
+        ;;
+
+    --nginx-security)
+        cmd_nginx_security "$@"
+        ;;
+
+    --nginx-rate-limit)
+        cmd_nginx_rate_limit "$@"
+        ;;
+
+    --nginx-block-ip)
+        cmd_nginx_block_ip "$@"
+        ;;
+
+    --nginx-whitelist-ip)
+        cmd_nginx_whitelist_ip "$@"
+        ;;
+
+    --nginx-logs)
+        cmd_nginx_logs "$@"
+        ;;
+
     --nginx-logs-clear)
-        die "${COMMAND} is not implemented yet."
+        cmd_nginx_logs_clear "$@"
         ;;
 
     # SSL
