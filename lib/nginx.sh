@@ -16,6 +16,7 @@ HOSTCTL_NGINX_RATE_ZONE_CONF="${NGINX_CONF_D}/hostctl-rate-limit.conf"
 HOSTCTL_NGINX_BLOCKED_IPS_CONF="${NGINX_CONF_D}/hostctl-blocked-ips.conf"
 HOSTCTL_NGINX_ALLOWED_IPS_CONF="${NGINX_CONF_D}/hostctl-allowed-ips.conf"
 HOSTCTL_NGINX_DOMAIN_SNIPPET="${NGINX_SNIPPETS}/hostctl-domain-access.conf"
+HOSTCTL_NGINX_GLOBAL_ACCESS_SNIPPET="${NGINX_SNIPPETS}/hostctl-global-access.conf"
 HOSTCTL_NGINX_STATE_DIR="${HOSTCTL_STATE_DIR}/nginx"
 
 DOMAIN_TARGET_PATH=""
@@ -103,16 +104,33 @@ validate_nginx_config() {
     return 0
 }
 
+restart_nginx() {
+    nginx_debug "command: systemctl restart nginx"
+    if ! systemctl restart nginx; then
+        error "Nginx failed to restart after configuration change."
+        return 1
+    fi
+
+    nginx_debug "command: systemctl is-active --quiet nginx"
+    if ! systemctl is-active --quiet nginx; then
+        error "Nginx failed to start after configuration change."
+        return 1
+    fi
+
+    success "Nginx restarted."
+    return 0
+}
+
 reload_nginx() {
-    nginx_debug "command: systemctl reload nginx"
-    systemctl reload nginx
+    restart_nginx
 }
 
 nginx_test_and_reload() {
     local domain="${1:-}"
 
     validate_nginx_config "$domain" || return 1
-    reload_nginx || return 1
+    success "Nginx configuration valid."
+    restart_nginx || return 1
 }
 
 restore_file_backup() {
@@ -155,6 +173,7 @@ write_managed_file_with_rollback() {
     warning "Nginx validation failed; rolling back."
     restore_file_backup "$backup" "$target"
     validate_nginx_config || true
+    restart_nginx || true
     log_event "${log_name} result=failed target=${target}"
     return 1
 }
@@ -931,6 +950,24 @@ render_domain_config() {
             -e "s|{{UPSTREAM}}|${upstream}|g" \
             -e "s|{{CLIENT_MAX_BODY_SIZE}}|${body_size}|g" \
             "$template" > "$output"
+        if ! grep -Fq "include ${HOSTCTL_NGINX_GLOBAL_ACCESS_SNIPPET};" "$output"; then
+            local rendered_temp
+            rendered_temp="$(mktemp)"
+            awk -v old_include="include ${HOSTCTL_NGINX_DOMAIN_SNIPPET};" \
+                -v global_include="include ${HOSTCTL_NGINX_GLOBAL_ACCESS_SNIPPET};" \
+                -v domain_include="include $(domain_access_snippet "$domain");" '
+                index($0, old_include) {
+                    indent = $0;
+                    sub(/[^[:space:]].*$/, "", indent);
+                    print indent global_include;
+                    print indent domain_include;
+                    print $0;
+                    next;
+                }
+                { print }
+            ' "$output" > "$rendered_temp"
+            mv "$rendered_temp" "$output"
+        fi
         return 0
     fi
 
@@ -945,6 +982,8 @@ server {
     client_max_body_size ${body_size};
 
     location / {
+        include ${HOSTCTL_NGINX_GLOBAL_ACCESS_SNIPPET};
+        include $(domain_access_snippet "$domain");
         include ${HOSTCTL_NGINX_DOMAIN_SNIPPET};
         proxy_pass ${upstream};
 
@@ -1000,6 +1039,7 @@ disable_default_site_if_requested() {
             if ! nginx_test_and_reload; then
                 ln -sfn "${NGINX_SITES_AVAILABLE}/default" "$default_link"
                 validate_nginx_config || true
+                restart_nginx || true
                 return 1
             fi
         fi
@@ -1066,6 +1106,7 @@ deploy_domain_config() {
     fi
     restore_conflicting_domain_link
     validate_nginx_config || true
+    restart_nginx || true
     log_event "NGINX_DOMAIN_CREATE domain=${domain} result=failed"
     return 1
 }
@@ -1239,6 +1280,7 @@ restore_domain_previous_state() {
         warning "Restored Nginx state failed validation; rolling back."
         rollback_restored_domain_links
         validate_nginx_config || true
+        restart_nginx || true
         log_event "NGINX_DOMAIN_ENABLE domain=${domain} mode=restore result=failed"
         return 1
     fi
@@ -1247,12 +1289,14 @@ restore_domain_previous_state() {
         error "Restored state did not reactivate HTTP for ${domain}."
         rollback_restored_domain_links
         validate_nginx_config || true
+        restart_nginx || true
         return 1
     fi
     if [[ "$expected_https" -eq 1 ]] && ! domain_has_https_active "$domain"; then
         error "Restored state did not reactivate HTTPS for ${domain}."
         rollback_restored_domain_links
         validate_nginx_config || true
+        restart_nginx || true
         return 1
     fi
 
@@ -1332,6 +1376,7 @@ enable_domain() {
 
     rm -f "$enabled"
     validate_nginx_config || true
+    restart_nginx || true
     log_event "NGINX_DOMAIN_ENABLE domain=${domain} result=failed source=${source}"
     return 1
 }
@@ -1484,6 +1529,7 @@ disable_domain_active_configs() {
         warning "Disable failed validation; rolling back."
         rollback_domain_disable_state
         validate_nginx_config || true
+        restart_nginx || true
         log_event "NGINX_DOMAIN_DISABLE domain=${domain} result=failed"
         return 1
     fi
@@ -1492,6 +1538,7 @@ disable_domain_active_configs() {
         error "Domain still appears in active Nginx configuration after disable."
         rollback_domain_disable_state
         validate_nginx_config || true
+        restart_nginx || true
         log_event "NGINX_DOMAIN_DISABLE domain=${domain} result=failed"
         return 1
     fi
@@ -1500,6 +1547,7 @@ disable_domain_active_configs() {
         error "Domain still appears in active Nginx configuration after disable."
         rollback_domain_disable_state
         validate_nginx_config || true
+        restart_nginx || true
         log_event "NGINX_DOMAIN_DISABLE domain=${domain} result=failed"
         return 1
     else
@@ -1508,6 +1556,7 @@ disable_domain_active_configs() {
             error "Unable to inspect active Nginx configuration after disable."
             rollback_domain_disable_state
             validate_nginx_config || true
+            restart_nginx || true
             log_event "NGINX_DOMAIN_DISABLE domain=${domain} result=failed"
             return 1
         fi
@@ -1588,6 +1637,8 @@ configure_reverse_proxy() {
     body_size="$(select_body_size)"
 
     ensure_domain_snippet
+    ensure_global_access_snippet
+    ensure_domain_access_snippet "$domain"
     temp_file="$(mktemp)"
     render_domain_config "$domain" "$upstream" "$body_size" "$temp_file"
     deploy_domain_config "$domain" "$temp_file"
@@ -1794,6 +1845,7 @@ remove_managed_nginx_file() {
 
     rollback_file "$backup" "$target" || true
     validate_nginx_config || true
+    restart_nginx || true
     log_event "${log_name} action=remove result=failed target=${target}"
     return 1
 }
@@ -1802,6 +1854,37 @@ rate_zone_name() {
     local domain="$1"
 
     printf 'hostctl_%s\n' "$domain" | tr '.-' '__' | tr -cd 'A-Za-z0-9_'
+}
+
+domain_access_snippet() {
+    local domain="$1"
+    local safe_domain
+
+    safe_domain="$(printf '%s\n' "$domain" | tr '.-' '__' | tr -cd 'A-Za-z0-9_')"
+    printf '%s/hostctl-access-%s.conf\n' "$NGINX_SNIPPETS" "$safe_domain"
+}
+
+ensure_access_snippet_file() {
+    local target="$1"
+    local title="$2"
+
+    if [[ ! -f "$target" ]]; then
+        mkdir -p "$(dirname "$target")"
+        {
+            printf '# Managed by hostctl\n'
+            printf '# %s\n' "$title"
+        } > "$target"
+    fi
+}
+
+ensure_global_access_snippet() {
+    ensure_access_snippet_file "$HOSTCTL_NGINX_GLOBAL_ACCESS_SNIPPET" "HOSTCTL GLOBAL ACCESS RULES"
+}
+
+ensure_domain_access_snippet() {
+    local domain="$1"
+
+    ensure_access_snippet_file "$(domain_access_snippet "$domain")" "HOSTCTL ACCESS RULES ${domain}"
 }
 
 select_rate_profile() {
@@ -1845,6 +1928,11 @@ managed_rule_files() {
     printf '%s\n' "$HOSTCTL_NGINX_BLOCKED_IPS_CONF"
     printf '%s\n' "$HOSTCTL_NGINX_ALLOWED_IPS_CONF"
     printf '%s\n' "$HOSTCTL_NGINX_RATE_ZONE_CONF"
+    printf '%s\n' "$HOSTCTL_NGINX_GLOBAL_ACCESS_SNIPPET"
+
+    if [[ -d "$NGINX_SNIPPETS" ]]; then
+        find "$NGINX_SNIPPETS" -maxdepth 1 -type f -name 'hostctl-access-*.conf' -print
+    fi
 
     if [[ -d "$NGINX_SITES_AVAILABLE" ]]; then
         find "$NGINX_SITES_AVAILABLE" -maxdepth 1 -type f -print |
@@ -1910,6 +1998,37 @@ rule_kind_from_marker() {
         "# HOSTCTL:RATE-LIMIT:"*) printf 'rate\n' ;;
         "# HOSTCTL:RATE-ZONE:"*) printf 'zone\n' ;;
     esac
+}
+
+rule_marker_type() {
+    local kind="$1"
+    local mode="${2:-}"
+
+    case "$kind:$mode" in
+        block:*) printf 'BLOCK-IP\n' ;;
+        allow:allow-only) printf 'ALLOW-ONLY\n' ;;
+        allow:*) printf 'ALLOW-IP\n' ;;
+        rate:*) printf 'RATE-LIMIT\n' ;;
+        zone:*) printf 'RATE-ZONE\n' ;;
+    esac
+}
+
+find_managed_rule_block() {
+    local file="$1"
+    local type="$2"
+    local id="$3"
+    local begin_line
+    local end_line
+
+    begin_line="$(grep -nF "# HOSTCTL:${type}:BEGIN id=${id}" "$file" | head -n 1 | cut -d: -f1 || true)"
+    end_line="$(grep -nF "# HOSTCTL:${type}:END id=${id}" "$file" | head -n 1 | cut -d: -f1 || true)"
+
+    if [[ -z "$begin_line" || -z "$end_line" || ! "$begin_line" =~ ^[0-9]+$ || ! "$end_line" =~ ^[0-9]+$ || "$end_line" -le "$begin_line" ]]; then
+        error "Managed rule block is incomplete or missing."
+        return 1
+    fi
+
+    printf '%s|%s\n' "$begin_line" "$end_line"
 }
 
 rule_value_from_directive() {
@@ -2229,6 +2348,98 @@ assert_single_enabled_domain_owner() {
     return 0
 }
 
+ensure_location_include() {
+    local target="$1"
+    local include_path="$2"
+    local domain="${3:-}"
+    local backup=""
+    local temp_file
+    local awk_status=0
+
+    [[ -f "$target" ]] || return 1
+    if grep -Fq "include ${include_path};" "$target"; then
+        return 0
+    fi
+
+    if ! grep -q 'Managed by hostctl' "$target"; then
+        warning "This configuration was not created by hostctl: ${target}"
+        warning "hostctl needs to insert an access-rule include before the rule can be effective."
+        if ! confirm "Continue?" "no"; then
+            warning "Access rule update cancelled."
+            return 1
+        fi
+    fi
+
+    backup="$(backup_file "$target" || true)"
+    temp_file="$(mktemp)"
+    if awk -v include_path="$include_path" '
+        BEGIN { inserted = 0 }
+        /location[[:space:]]+\/[[:space:]]*\{/ && inserted == 0 {
+            print;
+            print "        include " include_path ";";
+            inserted = 1;
+            next;
+        }
+        { print }
+        END { if (inserted == 0) exit 2 }
+    ' "$target" > "$temp_file"; then
+        awk_status=0
+    else
+        awk_status=$?
+    fi
+
+    if [[ "$awk_status" -eq 2 ]]; then
+        rm -f "$temp_file"
+        error "Could not find a location / block in ${target}."
+        return 1
+    elif [[ "$awk_status" -ne 0 ]]; then
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    cp "$temp_file" "$target" || {
+        rm -f "$temp_file"
+        return 1
+    }
+    rm -f "$temp_file"
+
+    if nginx_test_and_reload "$domain"; then
+        return 0
+    fi
+
+    warning "Access include failed validation; rolling back."
+    restore_file_backup "$backup" "$target"
+    validate_nginx_config || true
+    restart_nginx || true
+    return 1
+}
+
+ensure_domain_access_includes() {
+    local domain="$1"
+    local target
+
+    target="$(domain_config_for_rule_scope "$domain")" || return 1
+    ensure_global_access_snippet
+    ensure_domain_access_snippet "$domain"
+    ensure_location_include "$target" "$HOSTCTL_NGINX_GLOBAL_ACCESS_SNIPPET" "$domain" || return 1
+    ensure_location_include "$target" "$(domain_access_snippet "$domain")" "$domain" || return 1
+}
+
+ensure_global_access_includes() {
+    local domain
+    local records
+
+    ensure_global_access_snippet
+    records="$(detect_nginx_domains || true)"
+    [[ -z "$records" ]] && return 0
+
+    while IFS= read -r domain; do
+        [[ -n "$domain" ]] || continue
+        domain_is_active "$domain" || continue
+        ensure_domain_access_includes "$domain" || return 1
+    done <<< "$records"
+}
+
 apply_nginx_file_updates() {
     local log_name="$1"
     local domain="${2:-}"
@@ -2261,6 +2472,7 @@ apply_nginx_file_updates() {
         restore_file_backup "$backup" "$file"
     done
     validate_nginx_config || true
+    restart_nginx || true
     log_event "${log_name} result=failed domain=${domain:-none}"
     return 1
 }
@@ -2283,6 +2495,7 @@ replace_file_from_temp_with_validation() {
     warning "Nginx validation failed; rolling back."
     restore_file_backup "$backup" "$target"
     validate_nginx_config || true
+    restart_nginx || true
     log_event "${log_name} result=failed target=${target} domain=${domain:-none}"
     return 1
 }
@@ -2392,7 +2605,13 @@ remove_rule_record_from_file() {
     local file="$1"
     local rule_id="$2"
     local line_no="$3"
+    local kind="${4:-}"
+    local mode="${5:-}"
     local temp_file
+    local marker_type
+    local block
+    local begin_line
+    local end_line
 
     if [[ ! "$line_no" =~ ^[0-9]+$ ]]; then
         error "Internal rule parsing error: invalid line number '${line_no}'"
@@ -2400,6 +2619,19 @@ remove_rule_record_from_file() {
     fi
 
     temp_file="$(mktemp)"
+    if [[ -n "$rule_id" && "$rule_id" != legacy_* ]]; then
+        marker_type="$(rule_marker_type "$kind" "$mode")"
+        block="$(find_managed_rule_block "$file" "$marker_type" "$rule_id")" || {
+            rm -f "$temp_file"
+            return 1
+        }
+        begin_line="${block%%|*}"
+        end_line="${block#*|}"
+        awk -v begin_line="$begin_line" -v end_line="$end_line" 'NR < begin_line || NR > end_line { print }' "$file" > "$temp_file"
+        printf '%s\n' "$temp_file"
+        return 0
+    fi
+
     local awk_status=0
     if awk -v rule_id="$rule_id" -v target_line="$line_no" '
         function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
@@ -2481,13 +2713,13 @@ remove_allow_only_for_scope() {
     local record
     local line_no
 
-    records="$(collect_managed_rules allow | awk -F'|' -v scope="$scope" '$4 == scope && $9 == "allow-only"')"
+    records="$(collect_managed_rules allow | awk -F'|' -v scope="$scope" '$2 == scope && $10 == "allow-only"')"
     if [[ -n "$records" ]]; then
         while IFS= read -r record; do
             parse_rule_record "$record" || return 1
             file="$RULE_FILE"
             line_no="$RULE_LINE"
-            temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no")" || return 1
+            temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no" "$RULE_TYPE" "$RULE_MODE")" || return 1
             cp "$temp_file" "$file"
             rm -f "$temp_file"
             changed="yes"
@@ -2550,6 +2782,105 @@ warn_real_ip_if_needed() {
     fi
 }
 
+ssh_client_ip() {
+    awk '{ print $1; exit }' <<< "${SSH_CONNECTION:-}"
+}
+
+warn_global_allow_only() {
+    local value="$1"
+    local client_ip
+
+    warning "GLOBAL allow-only mode affects every hostctl-managed Nginx domain."
+    warning "If your current public IP is not allowed, you may block your own HTTP/HTTPS access."
+    client_ip="$(ssh_client_ip)"
+    if [[ -n "$client_ip" && "$client_ip" != "$value" ]]; then
+        warning "Allowed IP does not match the current SSH client IP: ${client_ip}"
+    fi
+    confirm "Continue?" "no"
+}
+
+prepare_access_rule_target() {
+    local scope="$1"
+    local type="$2"
+
+    if [[ "$scope" == "global" ]]; then
+        ensure_global_access_snippet >&2
+        ensure_global_access_includes >&2 || return 1
+    else
+        ensure_domain_access_snippet "$scope" >&2
+        ensure_domain_access_includes "$scope" >&2 || return 1
+    fi
+
+    target_for_scope "$scope" "$type"
+}
+
+active_domain_includes_snippet() {
+    local domain="$1"
+    local snippet="$2"
+    local records
+    local record
+    local real_path
+
+    records="$(active_domain_config_records "$domain" || true)"
+    [[ -z "$records" ]] && return 1
+
+    while IFS= read -r record; do
+        real_path="$(cut -d'|' -f2 <<< "$record")"
+        [[ -f "$real_path" ]] || continue
+        grep -Fq "include ${snippet};" "$real_path" && return 0
+    done <<< "$records"
+
+    return 1
+}
+
+verify_access_rule_effective() {
+    local scope="$1"
+    local target="$2"
+    local rule_id="$3"
+    local snippet
+    local domain
+    local domains
+
+    grep -Fq "id=${rule_id}" "$target" || {
+        error "Rule was not written to the managed access snippet."
+        return 1
+    }
+
+    if [[ "$scope" == "global" ]]; then
+        snippet="$HOSTCTL_NGINX_GLOBAL_ACCESS_SNIPPET"
+        domains="$(detect_nginx_domains || true)"
+        while IFS= read -r domain; do
+            [[ -n "$domain" ]] || continue
+            domain_is_active "$domain" || continue
+            if ! active_domain_includes_snippet "$domain" "$snippet"; then
+                error "Rule was written but is not referenced by the active domain configuration."
+                error "Missing include for ${domain}: ${snippet}"
+                return 1
+            fi
+        done <<< "$domains"
+    else
+        snippet="$(domain_access_snippet "$scope")"
+        if ! active_domain_includes_snippet "$scope" "$snippet"; then
+            error "Rule was written but is not referenced by the active domain configuration."
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+verify_rule_removed() {
+    local file="$1"
+    local rule_id="$2"
+
+    if [[ "$rule_id" != legacy_* ]] && grep -Fq "id=${rule_id}" "$file"; then
+        error "Managed rule still exists after removal: id=${rule_id}"
+        return 1
+    fi
+
+    return 0
+}
+
 select_ip_scope() {
     select_option "$1" "Globally" "Specific domain"
 }
@@ -2595,11 +2926,10 @@ target_for_scope() {
 
     if [[ "$scope" == "global" ]]; then
         case "$type" in
-            block) printf '%s\n' "$HOSTCTL_NGINX_BLOCKED_IPS_CONF" ;;
-            allow) printf '%s\n' "$HOSTCTL_NGINX_ALLOWED_IPS_CONF" ;;
+            block|allow) printf '%s\n' "$HOSTCTL_NGINX_GLOBAL_ACCESS_SNIPPET" ;;
         esac
     else
-        domain_config_for_rule_scope "$scope"
+        printf '%s\n' "$(domain_access_snippet "$scope")"
     fi
 }
 
@@ -2609,16 +2939,25 @@ add_block_ip_rule() {
     local target
     local marker
     local directive
+    local id
+    local result
 
-    target="$(target_for_scope "$scope" block)" || return 1
+    target="$(prepare_access_rule_target "$scope" block)" || return 1
     directive="deny ${value};"
     if [[ "$scope" == "global" ]]; then
         marker="# HOSTCTL:BLOCK-IP:BEGIN id=$(rule_id block "$value") scope=global value=${value}"
+        id="$(marker_field "$marker" id)"
         append_managed_global_rule "$target" "$marker" "$directive" "NGINX_BLOCK_IP_ADD"
+        result=$?
     else
         marker="# HOSTCTL:BLOCK-IP:BEGIN id=$(rule_id block "$value") domain=${scope} value=${value}"
-        insert_managed_block_in_location "$target" "$marker" "$directive" "NGINX_BLOCK_IP_ADD" "$scope"
+        id="$(marker_field "$marker" id)"
+        append_managed_global_rule "$target" "$marker" "$directive" "NGINX_BLOCK_IP_ADD"
+        result=$?
     fi
+    [[ "$result" -eq 0 ]] || return "$result"
+    verify_access_rule_effective "$scope" "$target" "$id" || return 1
+    success "Block rule added and active."
 }
 
 add_allow_ip_rule() {
@@ -2630,13 +2969,19 @@ add_allow_ip_rule() {
     local directive
     local backup=""
     local temp_file
+    local id
+    local result
 
-    target="$(target_for_scope "$scope" allow)" || return 1
-    directive="allow ${value};"
     if [[ "$mode" == "allow-only" ]]; then
-        warning "This mode will deny all clients except allowed addresses."
-        confirm "Continue?" "no" || return 0
+        if [[ "$scope" == "global" ]]; then
+            warn_global_allow_only "$value" || return 0
+        else
+            warning "This mode will deny all clients except allowed addresses."
+            confirm "Continue?" "no" || return 0
+        fi
     fi
+    target="$(prepare_access_rule_target "$scope" allow)" || return 1
+    directive="allow ${value};"
 
     if [[ "$scope" == "global" ]]; then
         if [[ "$mode" == "allow-only" ]]; then
@@ -2644,6 +2989,7 @@ add_allow_ip_rule() {
         else
             marker="# HOSTCTL:ALLOW-IP:BEGIN id=$(rule_id allow "$value") scope=global value=${value}"
         fi
+        id="$(marker_field "$marker" id)"
         temp_file="$(mktemp)"
         [[ -f "$target" ]] && cp "$target" "$temp_file" || printf '# Managed by hostctl\n' > "$temp_file"
         grep -Fq "$marker" "$temp_file" || printf '%s\n%s\n' "$marker" "$directive" >> "$temp_file"
@@ -2653,9 +2999,12 @@ add_allow_ip_rule() {
             printf '%s\n' "$(managed_end_marker "$marker")" >> "$temp_file"
         fi
         replace_file_from_temp_with_validation "$target" "$temp_file" "NGINX_ALLOW_IP_ADD"
-        local result=$?
+        result=$?
         rm -f "$temp_file"
-        return "$result"
+        [[ "$result" -eq 0 ]] || return "$result"
+        verify_access_rule_effective "$scope" "$target" "$id" || return 1
+        success "Whitelist rule added and active."
+        return 0
     else
         if [[ "$mode" == "allow-only" ]]; then
             marker="# HOSTCTL:ALLOW-ONLY:BEGIN id=$(rule_id allow "$value") domain=${scope} value=${value}"
@@ -2663,7 +3012,10 @@ add_allow_ip_rule() {
         else
             marker="# HOSTCTL:ALLOW-IP:BEGIN id=$(rule_id allow "$value") domain=${scope} value=${value}"
         fi
-        insert_managed_block_in_location "$target" "$marker" "$directive" "NGINX_ALLOW_IP_ADD" "$scope" || return 1
+        id="$(marker_field "$marker" id)"
+        append_managed_global_rule "$target" "$marker" "$directive" "NGINX_ALLOW_IP_ADD" || return 1
+        verify_access_rule_effective "$scope" "$target" "$id" || return 1
+        success "Whitelist rule added and active."
     fi
 }
 
@@ -2729,7 +3081,7 @@ cmd_nginx_block_ip_edit() {
     done
     new_scope="$(select_scope_for_rule "$scope")" || return 1
 
-    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no")" || return 1
+    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no" "$RULE_TYPE" "$RULE_MODE")" || return 1
     replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_BLOCK_IP_EDIT" "$([[ "$scope" != "global" ]] && printf '%s' "$scope")" || {
         rm -f "$temp_file"
         return 1
@@ -2762,11 +3114,14 @@ cmd_nginx_block_ip_remove() {
     value="$RULE_VALUE"
 
     confirm "Remove ${value} from ${scope}?" "no" || return 0
-    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no")" || return 1
+    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no" "$RULE_TYPE" "$RULE_MODE")" || return 1
     replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_BLOCK_IP_REMOVE" "$([[ "$scope" != "global" ]] && printf '%s' "$scope")"
     local result=$?
     rm -f "$temp_file"
-    [[ "$result" -eq 0 ]] && success "Block rule removed."
+    if [[ "$result" -eq 0 ]]; then
+        verify_rule_removed "$file" "$RULE_ID" || return 1
+        success "Block rule removed."
+    fi
     return "$result"
 }
 
@@ -2832,7 +3187,7 @@ cmd_nginx_whitelist_ip_edit() {
     mode="trusted"
     [[ "$mode_choice" == "allow-only" ]] && mode="allow-only"
 
-    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no")" || return 1
+    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no" "$RULE_TYPE" "$RULE_MODE")" || return 1
     replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_ALLOW_IP_EDIT" "$([[ "$scope" != "global" ]] && printf '%s' "$scope")" || {
         rm -f "$temp_file"
         return 1
@@ -2878,7 +3233,7 @@ cmd_nginx_whitelist_ip_remove() {
     fi
 
     confirm "Remove whitelist rule for ${value} from ${scope}?" "no" || return 0
-    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no")" || return 1
+    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no" "$RULE_TYPE" "$RULE_MODE")" || return 1
     replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_ALLOW_IP_REMOVE" "$([[ "$scope" != "global" ]] && printf '%s' "$scope")" || {
         rm -f "$temp_file"
         return 1
@@ -2888,6 +3243,7 @@ cmd_nginx_whitelist_ip_remove() {
         remove_allow_only_for_scope "$scope" || true
         nginx_test_and_reload "$([[ "$scope" != "global" ]] && printf '%s' "$scope")"
     fi
+    verify_rule_removed "$file" "$RULE_ID" || return 1
     success "Whitelist rule removed."
 }
 
@@ -3008,7 +3364,7 @@ cmd_nginx_rate_limit_edit() {
     rate="${rate_burst%%|*}"
     burst="${rate_burst##*|}"
 
-    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no")" || return 1
+    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no" "$RULE_TYPE" "$RULE_MODE")" || return 1
     replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_RATE_LIMIT_EDIT" "$domain" || {
         rm -f "$temp_file"
         return 1
@@ -3037,7 +3393,7 @@ cmd_nginx_rate_limit_remove() {
     [[ -n "$zone" ]] || zone="$(rate_zone_name "$domain")"
 
     confirm "Remove rate limit for ${domain}?" "no" || return 0
-    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no")" || return 1
+    temp_file="$(remove_rule_record_from_file "$file" "$RULE_ID" "$line_no" "$RULE_TYPE" "$RULE_MODE")" || return 1
     replace_file_from_temp_with_validation "$file" "$temp_file" "NGINX_RATE_LIMIT_REMOVE" "$domain" || {
         rm -f "$temp_file"
         return 1
@@ -3054,7 +3410,10 @@ cmd_nginx_rate_limit_remove() {
     replace_file_from_temp_with_validation "$HOSTCTL_NGINX_RATE_ZONE_CONF" "$zone_file" "NGINX_RATE_LIMIT_REMOVE" "$domain"
     local result=$?
     rm -f "$zone_file"
-    [[ "$result" -eq 0 ]] && success "Rate limit removed."
+    if [[ "$result" -eq 0 ]]; then
+        verify_rule_removed "$file" "$RULE_ID" || return 1
+        success "Rate limit removed."
+    fi
     return "$result"
 }
 
