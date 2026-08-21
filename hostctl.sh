@@ -11,6 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 COMMON_LIB="${SCRIPT_DIR}/lib/common.sh"
 INIT_LIB="${SCRIPT_DIR}/lib/init.sh"
+SYSTEM_LIB="${SCRIPT_DIR}/lib/system.sh"
 
 # ---------------------------------------------------------
 # Load required libraries
@@ -30,6 +31,13 @@ fi
 
 # shellcheck source=lib/init.sh
 source "$INIT_LIB"
+
+if [[ ! -f "$SYSTEM_LIB" ]]; then
+    die "Missing required library: $SYSTEM_LIB"
+fi
+
+# shellcheck source=lib/system.sh
+source "$SYSTEM_LIB"
 
 # ---------------------------------------------------------
 # Help
@@ -188,15 +196,15 @@ case "$COMMAND" in
 
     # System
     --update)
-        die "--update is not implemented yet."
+        cmd_update "$@"
         ;;
 
     --vram)
-        die "--vram is not implemented yet."
+        cmd_vram "$@"
         ;;
 
     --cleanup)
-        die "--cleanup is not implemented yet."
+        cmd_cleanup "$@"
         ;;
 
     --security)
