@@ -6,7 +6,21 @@ set -Eeuo pipefail
 # hostctl - Main CLI Router
 # =========================================================
 
-SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+resolve_script_path() {
+    local path="$1"
+
+    if command -v readlink >/dev/null 2>&1 && readlink -f "$path" >/dev/null 2>&1; then
+        readlink -f "$path"
+    elif command -v realpath >/dev/null 2>&1; then
+        realpath "$path"
+    else
+        # Fallback keeps relative invocations usable even when symlink
+        # resolution tools are unavailable.
+        cd "$(dirname "$path")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$path")"
+    fi
+}
+
+SCRIPT_PATH="$(resolve_script_path "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 COMMON_LIB="${SCRIPT_DIR}/lib/common.sh"
