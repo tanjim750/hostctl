@@ -167,6 +167,7 @@ Database / Backup:
   --db-health              Run fast read-only database health checks
                            Supports: --profile NAME [--cron]
   --db-diagnose            Run read-only database diagnostics
+                           Supports: --profile NAME [--cron]
   --backup-now             Run backup now
   --backup-schedule        Configure backup cron
   --backup-status          Show backup status

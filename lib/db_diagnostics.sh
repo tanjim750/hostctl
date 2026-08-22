@@ -174,6 +174,7 @@ health_record() {
     local status="$1"
     local label="$2"
     local detail="${3:-}"
+    local detail_body="${4:-}"
     local icon
     local result_id
 
@@ -189,7 +190,7 @@ health_record() {
     DB_DIAGNOSTIC_TITLES+=("$label")
     DB_DIAGNOSTIC_STATUSES+=("$status")
     DB_DIAGNOSTIC_SUMMARIES+=("$detail")
-    DB_DIAGNOSTIC_DETAILS+=("$(diagnostic_detail_for_result "$status" "$label" "$detail")")
+    DB_DIAGNOSTIC_DETAILS+=("$(diagnostic_detail_for_result "$status" "$label" "$detail" "$detail_body")")
     DB_DIAGNOSTIC_FIX_SUPPORTED+=("0")
     DB_DIAGNOSTIC_RESULT_COUNT=$((DB_DIAGNOSTIC_RESULT_COUNT + 1))
 
@@ -207,11 +208,17 @@ diagnostic_detail_for_result() {
     local status="$1"
     local label="$2"
     local detail="${3:-}"
+    local detail_body="${4:-}"
 
     printf '%s\n' "$label"
     printf '%s\n\n' "----------------------------------------"
     printf 'Status: %s\n' "$status"
     [[ -n "$detail" ]] && printf 'Summary: %s\n' "$detail"
+    if [[ -n "$detail_body" ]]; then
+        echo
+        echo "Details:"
+        printf '%s\n' "$detail_body"
+    fi
     echo
     case "$status" in
         PASS)
@@ -529,10 +536,103 @@ health_check_backup_tool() {
     esac
 }
 
+diag_postgres_session_details() {
+    local sql="$1"
+    local output
+
+    output="$(diag_postgres_query "$sql" 2>/dev/null || true)"
+    if [[ -n "$output" ]]; then
+        printf '%s\n' "$output" | while IFS='|' read -r pid user db client state age wait blockers query; do
+            [[ -n "$pid" ]] || continue
+            printf -- '- PID: %s | user=%s | db=%s | client=%s | state=%s | age=%s | wait=%s | blockers=%s\n' \
+                "${pid:-unknown}" "${user:-unknown}" "${db:-unknown}" "${client:-unknown}" \
+                "${state:-unknown}" "${age:-unknown}" "${wait:-none}" "${blockers:-none}"
+            [[ -n "${query:-}" ]] && printf '  query: %s\n' "$(diag_short_query "$query")"
+        done
+    fi
+}
+
+diag_postgres_stale_transaction_details() {
+    diag_postgres_session_details "select pid, usename, datname, coalesce(client_addr::text,''), coalesce(state,''), coalesce(now()-xact_start, interval '0')::text, coalesce(wait_event_type || ':' || wait_event,''), array_to_string(pg_blocking_pids(pid), ','), regexp_replace(coalesce(query,''), '[[:space:]]+', ' ', 'g') from pg_stat_activity where pid <> pg_backend_pid() and xact_start is not null and now()-xact_start > (${DB_DIAG_IDLE_TX_SECONDS} || ' seconds')::interval order by xact_start asc limit 5;"
+}
+
+diag_postgres_idle_transaction_details() {
+    diag_postgres_session_details "select pid, usename, datname, coalesce(client_addr::text,''), coalesce(state,''), coalesce(now()-coalesce(xact_start,query_start), interval '0')::text, coalesce(wait_event_type || ':' || wait_event,''), array_to_string(pg_blocking_pids(pid), ','), regexp_replace(coalesce(query,''), '[[:space:]]+', ' ', 'g') from pg_stat_activity where pid <> pg_backend_pid() and state like 'idle in transaction%' and now()-coalesce(xact_start,query_start) > (${DB_DIAG_IDLE_TX_SECONDS} || ' seconds')::interval order by coalesce(xact_start,query_start) asc limit 5;"
+}
+
+diag_postgres_long_query_details() {
+    diag_postgres_session_details "select pid, usename, datname, coalesce(client_addr::text,''), coalesce(state,''), coalesce(now()-query_start, interval '0')::text, coalesce(wait_event_type || ':' || wait_event,''), array_to_string(pg_blocking_pids(pid), ','), regexp_replace(coalesce(query,''), '[[:space:]]+', ' ', 'g') from pg_stat_activity where pid <> pg_backend_pid() and state='active' and now()-query_start > (${DB_DIAG_LONG_QUERY_SECONDS} || ' seconds')::interval order by query_start asc limit 5;"
+}
+
+diag_postgres_lock_details() {
+    diag_postgres_session_details "select pid, usename, datname, coalesce(client_addr::text,''), coalesce(state,''), coalesce(now()-coalesce(query_start,xact_start), interval '0')::text, coalesce(wait_event_type || ':' || wait_event,''), array_to_string(pg_blocking_pids(pid), ','), regexp_replace(coalesce(query,''), '[[:space:]]+', ' ', 'g') from pg_stat_activity where pid <> pg_backend_pid() and (coalesce(array_length(pg_blocking_pids(pid), 1), 0) > 0 or wait_event_type='Lock') order by coalesce(query_start,xact_start) asc limit 5;"
+}
+
+diag_mysql_process_details() {
+    local where_clause="$1"
+    local output
+
+    output="$(diag_mysql_query "SELECT ID, USER, COALESCE(DB,''), COALESCE(HOST,''), COMMAND, TIME, COALESCE(STATE,''), LEFT(REPLACE(REPLACE(COALESCE(INFO,''), CHAR(10), ' '), CHAR(9), ' '), 160) FROM information_schema.PROCESSLIST WHERE ${where_clause} ORDER BY TIME DESC LIMIT 5;" 2>/dev/null || true)"
+    if [[ -n "$output" ]]; then
+        printf '%s\n' "$output" | while IFS=$'\t' read -r id user db host command seconds state info; do
+            [[ -n "$id" ]] || continue
+            printf -- '- Session: %s | user=%s | db=%s | client=%s | command=%s | age=%ss | state=%s\n' \
+                "${id:-unknown}" "${user:-unknown}" "${db:-unknown}" "${host:-unknown}" \
+                "${command:-unknown}" "${seconds:-unknown}" "${state:-unknown}"
+            [[ -n "${info:-}" ]] && printf '  query: %s\n' "$(diag_short_query "$info")"
+        done
+    fi
+}
+
+diag_mysql_stale_transaction_details() {
+    local output
+
+    output="$(diag_mysql_query "SELECT trx_mysql_thread_id, trx_started, trx_state, COALESCE(trx_query,''), TIMESTAMPDIFF(SECOND,trx_started,NOW()) FROM information_schema.INNODB_TRX WHERE TIMESTAMPDIFF(SECOND,trx_started,NOW()) > ${DB_DIAG_IDLE_TX_SECONDS} ORDER BY trx_started ASC LIMIT 5;" 2>/dev/null || true)"
+    if [[ -n "$output" ]]; then
+        printf '%s\n' "$output" | while IFS=$'\t' read -r thread started state query seconds; do
+            [[ -n "$thread" ]] || continue
+            printf -- '- Thread: %s | state=%s | age=%ss | started=%s\n' \
+                "${thread:-unknown}" "${state:-unknown}" "${seconds:-unknown}" "${started:-unknown}"
+            [[ -n "${query:-}" ]] && printf '  query: %s\n' "$(diag_short_query "$query")"
+        done
+    fi
+}
+
+diag_mysql_lock_wait_details() {
+    local output
+
+    output="$(diag_mysql_query "SELECT REQUESTING_ENGINE_TRANSACTION_ID, BLOCKING_ENGINE_TRANSACTION_ID, OBJECT_SCHEMA, OBJECT_NAME, LOCK_TYPE, LOCK_MODE FROM performance_schema.data_lock_waits JOIN performance_schema.data_locks ON data_lock_waits.REQUESTING_ENGINE_LOCK_ID=data_locks.ENGINE_LOCK_ID LIMIT 5;" 2>/dev/null || diag_mysql_query "SELECT requesting_trx_id, blocking_trx_id, '', '', '', '' FROM information_schema.INNODB_LOCK_WAITS LIMIT 5;" 2>/dev/null || true)"
+    if [[ -n "$output" ]]; then
+        printf '%s\n' "$output" | while IFS=$'\t' read -r waiting blocker schema object lock_type lock_mode; do
+            [[ -n "$waiting" ]] || continue
+            printf -- '- Waiting transaction: %s | blocker=%s | object=%s.%s | lock=%s %s\n' \
+                "${waiting:-unknown}" "${blocker:-unknown}" "${schema:-unknown}" "${object:-unknown}" \
+                "${lock_type:-unknown}" "${lock_mode:-unknown}"
+        done
+    fi
+}
+
+diag_mongo_currentop_details() {
+    local match="$1"
+    local output
+
+    output="$(diag_mongo_eval 'var ops=db.getSiblingDB("admin").aggregate([{$currentOp:{allUsers:false,idleConnections:true,idleSessions:true}},{$match:'"${match}"'},{$limit:5}]).toArray(); ops.forEach(function(o){ print([o.opid||o.op||"", o.appName||"", o.client||"", o.active, o.secs_running||0, o.waitingForLock||false, (o.ns||""), JSON.stringify(o.command||o.query||{}).substring(0,160)].join("|")); });' 2>/dev/null || true)"
+    if [[ -n "$output" ]]; then
+        printf '%s\n' "$output" | while IFS='|' read -r opid app client active seconds waiting ns command; do
+            [[ -n "$opid" || -n "$ns" || -n "$command" ]] || continue
+            printf -- '- Operation: %s | app=%s | client=%s | active=%s | age=%ss | waitingForLock=%s | ns=%s\n' \
+                "${opid:-unknown}" "${app:-unknown}" "${client:-unknown}" "${active:-unknown}" \
+                "${seconds:-unknown}" "${waiting:-unknown}" "${ns:-unknown}"
+            [[ -n "${command:-}" ]] && printf '  operation: %s\n' "$(diag_short_query "$command")"
+        done
+    fi
+}
+
 health_postgres() {
     local output
     local total max pct idle active idle_tx
     local stale idle_tx_count old_tx long_count lock_count deadlocks role size
+    local lock_details
 
     health_check_backup_tool
 
@@ -572,10 +672,10 @@ health_postgres() {
     stale="$(diag_postgres_query "select count(*) from pg_stat_activity where pid <> pg_backend_pid() and xact_start is not null and now()-xact_start > (${DB_DIAG_IDLE_TX_SECONDS} || ' seconds')::interval;" 2>/dev/null || true)"
     old_tx="$(diag_postgres_query "select count(*) from pg_stat_activity where pid <> pg_backend_pid() and xact_start is not null and now()-xact_start > '1 hour'::interval;" 2>/dev/null || true)"
     if [[ "$old_tx" =~ ^[0-9]+$ && "$old_tx" -gt 0 ]]; then
-        health_record FAIL "Stale transactions failed" "${old_tx} extremely old transaction(s)"
+        health_record FAIL "Stale transactions failed" "${old_tx} extremely old transaction(s)" "$(diag_postgres_stale_transaction_details)"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$stale" =~ ^[0-9]+$ && "$stale" -gt 0 ]]; then
-        health_record WARNING "Stale transactions warning" "${stale} detected"
+        health_record WARNING "Stale transactions warning" "${stale} detected" "$(diag_postgres_stale_transaction_details)"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$stale" =~ ^[0-9]+$ ]]; then
         health_record PASS "Stale transactions passed"
@@ -585,7 +685,7 @@ health_postgres() {
 
     idle_tx_count="$(diag_postgres_query "select count(*) from pg_stat_activity where pid <> pg_backend_pid() and state like 'idle in transaction%' and now()-coalesce(xact_start,query_start) > (${DB_DIAG_IDLE_TX_SECONDS} || ' seconds')::interval;" 2>/dev/null || true)"
     if [[ "$idle_tx_count" =~ ^[0-9]+$ && "$idle_tx_count" -gt 0 ]]; then
-        health_record WARNING "Idle-in-transaction warning" "${idle_tx_count} detected"
+        health_record WARNING "Idle-in-transaction warning" "${idle_tx_count} detected" "$(diag_postgres_idle_transaction_details)"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$idle_tx_count" =~ ^[0-9]+$ ]]; then
         health_record PASS "Idle-in-transaction passed"
@@ -595,7 +695,7 @@ health_postgres() {
 
     long_count="$(diag_postgres_query "select count(*) from pg_stat_activity where pid <> pg_backend_pid() and state='active' and now()-query_start > (${DB_DIAG_LONG_QUERY_SECONDS} || ' seconds')::interval;" 2>/dev/null || true)"
     if [[ "$long_count" =~ ^[0-9]+$ && "$long_count" -gt 0 ]]; then
-        health_record WARNING "Long-running queries warning" "${long_count} detected"
+        health_record WARNING "Long-running queries warning" "${long_count} detected" "$(diag_postgres_long_query_details)"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$long_count" =~ ^[0-9]+$ ]]; then
         health_record PASS "Long-running queries passed"
@@ -605,9 +705,10 @@ health_postgres() {
 
     lock_count="$(diag_postgres_query "select count(*) from pg_stat_activity where pid <> pg_backend_pid() and (coalesce(array_length(pg_blocking_pids(pid), 1), 0) > 0 or wait_event_type='Lock');" 2>/dev/null || true)"
     if [[ "$lock_count" =~ ^[0-9]+$ && "$lock_count" -gt 0 ]]; then
-        health_record FAIL "Blocking sessions failed" "${lock_count} blocked/waiting session(s)"
-        health_record FAIL "Blocking chains failed" "active blockers detected"
-        health_record FAIL "Lock waits failed" "${lock_count} detected"
+        lock_details="$(diag_postgres_lock_details)"
+        health_record FAIL "Blocking sessions failed" "${lock_count} blocked/waiting session(s)" "$lock_details"
+        health_record FAIL "Blocking chains failed" "active blockers detected" "$lock_details"
+        health_record FAIL "Lock waits failed" "${lock_count} detected" "$lock_details"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$lock_count" =~ ^[0-9]+$ ]]; then
         health_record PASS "Blocking sessions passed"
@@ -638,6 +739,7 @@ health_postgres() {
 health_mysql_like() {
     local engine="$1"
     local output total sleep_count active_count max_conn pct stale lock_waits long_count deadlock_text db_size
+    local lock_details stale_details
 
     health_check_backup_tool
 
@@ -678,7 +780,7 @@ health_mysql_like() {
 
     long_count="$(diag_mysql_query "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE COMMAND <> 'Sleep' AND TIME > ${DB_DIAG_LONG_QUERY_SECONDS};" 2>/dev/null || true)"
     if [[ "$long_count" =~ ^[0-9]+$ && "$long_count" -gt 0 ]]; then
-        health_record WARNING "Long-running queries warning" "${long_count} detected"
+        health_record WARNING "Long-running queries warning" "${long_count} detected" "$(diag_mysql_process_details "COMMAND <> 'Sleep' AND TIME > ${DB_DIAG_LONG_QUERY_SECONDS}")"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$long_count" =~ ^[0-9]+$ ]]; then
         health_record PASS "Long-running queries passed"
@@ -688,8 +790,9 @@ health_mysql_like() {
 
     stale="$(diag_mysql_query "SELECT COUNT(*) FROM information_schema.INNODB_TRX WHERE TIMESTAMPDIFF(SECOND,trx_started,NOW()) > ${DB_DIAG_IDLE_TX_SECONDS};" 2>/dev/null || true)"
     if [[ "$stale" =~ ^[0-9]+$ && "$stale" -gt 0 ]]; then
-        health_record WARNING "Stale transactions warning" "${stale} detected"
-        health_record WARNING "Idle-in-transaction warning" "review InnoDB transaction state"
+        stale_details="$(diag_mysql_stale_transaction_details)"
+        health_record WARNING "Stale transactions warning" "${stale} detected" "$stale_details"
+        health_record WARNING "Idle-in-transaction warning" "review InnoDB transaction state" "$stale_details"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$stale" =~ ^[0-9]+$ ]]; then
         health_record PASS "Stale transactions passed"
@@ -705,9 +808,10 @@ health_mysql_like() {
         lock_waits="$(diag_mysql_query "SELECT COUNT(*) FROM information_schema.INNODB_LOCK_WAITS;" 2>/dev/null || true)"
     fi
     if [[ "$lock_waits" =~ ^[0-9]+$ && "$lock_waits" -gt 0 ]]; then
-        health_record FAIL "Blocking sessions failed" "${lock_waits} lock wait(s)"
-        health_record FAIL "Blocking chains failed" "active lock waits detected"
-        health_record FAIL "Lock waits failed" "${lock_waits} detected"
+        lock_details="$(diag_mysql_lock_wait_details)"
+        health_record FAIL "Blocking sessions failed" "${lock_waits} lock wait(s)" "$lock_details"
+        health_record FAIL "Blocking chains failed" "active lock waits detected" "$lock_details"
+        health_record FAIL "Lock waits failed" "${lock_waits} detected" "$lock_details"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$lock_waits" =~ ^[0-9]+$ ]]; then
         health_record PASS "Blocking sessions passed"
@@ -740,6 +844,7 @@ health_mysql_like() {
 
 health_mongodb() {
     local output current available ops locks tx repl size long_seconds
+    local lock_details
 
     long_seconds="$DB_DIAG_LONG_QUERY_SECONDS"
     [[ "$long_seconds" =~ ^[0-9]+$ ]] || long_seconds=300
@@ -794,7 +899,7 @@ health_mongodb() {
     tx="$(diag_mongo_eval 'var a=db.getSiblingDB("admin").aggregate([{$currentOp:{allUsers:false,idleConnections:true,idleSessions:true}},{$match:{"transaction.parameters.txnNumber":{$exists:true}}},{$count:"n"}]).toArray(); print(a.length ? a[0].n : 0);' 2>/dev/null || true)"
 
     if [[ "$tx" =~ ^[0-9]+$ && "$tx" -gt 0 ]]; then
-        health_record WARNING "Stale transactions warning" "${tx} transaction operation(s) visible"
+        health_record WARNING "Stale transactions warning" "${tx} transaction operation(s) visible" "$(diag_mongo_currentop_details '{"transaction.parameters.txnNumber":{$exists:true}}')"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$tx" =~ ^[0-9]+$ ]]; then
         health_record PASS "Stale transactions passed"
@@ -804,7 +909,7 @@ health_mongodb() {
     health_record UNSUPPORTED "Idle-in-transaction unsupported" "not a MongoDB health concept"
 
     if [[ "$ops" =~ ^[0-9]+$ && "$ops" -gt 0 ]]; then
-        health_record WARNING "Long-running operations warning" "${ops} detected"
+        health_record WARNING "Long-running operations warning" "${ops} detected" "$(diag_mongo_currentop_details '{active:true,secs_running:{$gt:'"${long_seconds}"'}}')"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$ops" =~ ^[0-9]+$ ]]; then
         health_record PASS "Long-running operations passed"
@@ -813,9 +918,10 @@ health_mongodb() {
     fi
 
     if [[ "$locks" =~ ^[0-9]+$ && "$locks" -gt 0 ]]; then
-        health_record FAIL "Blocking sessions failed" "${locks} operation(s) waiting for lock"
-        health_record FAIL "Blocking chains failed" "lock wait operations detected"
-        health_record FAIL "Lock waits failed" "${locks} detected"
+        lock_details="$(diag_mongo_currentop_details '{waitingForLock:true}')"
+        health_record FAIL "Blocking sessions failed" "${locks} operation(s) waiting for lock" "$lock_details"
+        health_record FAIL "Blocking chains failed" "lock wait operations detected" "$lock_details"
+        health_record FAIL "Lock waits failed" "${locks} detected" "$lock_details"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$locks" =~ ^[0-9]+$ ]]; then
         health_record PASS "Blocking sessions passed"
@@ -910,8 +1016,10 @@ run_database_diagnosis() {
         printf 'Confidence: %s\n' "$confidence"
         echo
 
+        set +e
         diagnostic_detail_loop
         detail_status=$?
+        set -e
         [[ "$detail_status" -eq 2 ]] || break
     done
 
