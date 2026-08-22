@@ -1308,7 +1308,11 @@ docker_postgres_connection_mode() {
     local host="${BACKUP_DB_HOST:-}"
     local container_name
 
-    resolve_backup_executor_runtime || return 1
+    if [[ "${BACKUP_DIAG_MODE:-0}" -eq 1 ]]; then
+        [[ -n "${BACKUP_RUNTIME_CONTAINER:-}" && "${BACKUP_RUNTIME_CONTAINER_STATE:-}" == "running" ]] || return 1
+    else
+        resolve_backup_executor_runtime || return 1
+    fi
     container_name="$(container_name_for_display "$BACKUP_RUNTIME_CONTAINER")"
     image="$(container_image_for_display "$BACKUP_RUNTIME_CONTAINER")"
     if image_matches_db_type "$image" postgresql ||
@@ -3586,6 +3590,10 @@ diag_postgres_query() {
 
     password="$(backup_password_env_prefix)"
     if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
+        if [[ "${BACKUP_DIAG_MODE:-0}" -eq 1 && ( -z "${BACKUP_RUNTIME_CONTAINER:-}" || "${BACKUP_RUNTIME_CONTAINER_STATE:-}" != "running" ) ]]; then
+            printf 'Docker runtime container unavailable: state=%s\n' "${BACKUP_RUNTIME_CONTAINER_STATE:-unknown}"
+            return 1
+        fi
         mode="$(docker_postgres_connection_mode)" || return 1
         while IFS= read -r -d '' arg; do
             args+=("$arg")
@@ -3610,6 +3618,10 @@ diag_mysql_query() {
 
     password="$(backup_password_env_prefix)"
     if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
+        if [[ "${BACKUP_DIAG_MODE:-0}" -eq 1 && ( -z "${BACKUP_RUNTIME_CONTAINER:-}" || "${BACKUP_RUNTIME_CONTAINER_STATE:-}" != "running" ) ]]; then
+            printf 'Docker runtime container unavailable: state=%s\n' "${BACKUP_RUNTIME_CONTAINER_STATE:-unknown}"
+            return 1
+        fi
         client="$(docker_mysql_client_command_name)"
         if [[ -n "$password" ]]; then
             timeout_command "$DB_DIAG_TIMEOUT" docker_target_exec_env "MYSQL_PWD=${password}" "$client" \
@@ -3632,6 +3644,7 @@ diag_mysql_query() {
 
 diag_mongo_shell_name() {
     if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
+        [[ "${BACKUP_DIAG_MODE:-0}" -eq 0 || -n "${BACKUP_RUNTIME_CONTAINER:-}" ]] || return 1
         if docker_target_has_executable mongosh; then
             printf 'mongosh\n'
         elif docker_target_has_executable mongo; then
@@ -3658,10 +3671,65 @@ diag_mongo_eval() {
     shell="$(diag_mongo_shell_name)" || return 1
     uri="$(mongo_connection_uri)"
     if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
+        if [[ "${BACKUP_DIAG_MODE:-0}" -eq 1 && ( -z "${BACKUP_RUNTIME_CONTAINER:-}" || "${BACKUP_RUNTIME_CONTAINER_STATE:-}" != "running" ) ]]; then
+            printf 'Docker runtime container unavailable: state=%s\n' "${BACKUP_RUNTIME_CONTAINER_STATE:-unknown}"
+            return 1
+        fi
         timeout_command "$DB_DIAG_TIMEOUT" docker_target_exec "$shell" "$uri" --quiet --eval "$js"
     else
         timeout_command "$DB_DIAG_TIMEOUT" "$shell" "$uri" --quiet --eval "$js"
     fi
+}
+
+diag_resolve_docker_runtime_readonly() {
+    local state
+    local container=""
+
+    [[ "$BACKUP_SOURCE_MODE" == "docker" ]] || return 0
+
+    if [[ "${BACKUP_DOCKER_TARGET_TYPE:-service}" == "container" ]]; then
+        if ! docker inspect "$BACKUP_DOCKER_CONTAINER" >/dev/null 2>&1; then
+            diag_record CRITICAL "Docker container not found." "container=${BACKUP_DOCKER_CONTAINER}"
+            return 1
+        fi
+        container="$BACKUP_DOCKER_CONTAINER"
+    else
+        container="$(resolve_compose_service_container "$BACKUP_DB_SERVICE")" || {
+            diag_record CRITICAL "No runtime container exists for Compose service." "service=${BACKUP_DB_SERVICE}"
+            return 1
+        }
+    fi
+
+    state="$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || true)"
+    BACKUP_RUNTIME_CONTAINER="$container"
+    BACKUP_RUNTIME_CONTAINER_STATE="$state"
+    BACKUP_DOCKER_IMAGE="$(container_image_for_display "$container")"
+
+    case "$state" in
+        running) ;;
+        restarting)
+            diag_record CRITICAL "Docker container is restarting." "container=$(container_name_for_display "$container")"
+            return 1
+            ;;
+        exited|created|paused|removing|dead|"")
+            diag_record CRITICAL "Docker container is not running." "container=$(container_name_for_display "$container"); state=${state:-unknown}"
+            return 1
+            ;;
+        *)
+            diag_record CRITICAL "Docker container state is not usable." "container=$(container_name_for_display "$container"); state=${state}"
+            return 1
+            ;;
+    esac
+
+    state="$(container_health_status "$container")"
+    if [[ "$state" == "unhealthy" ]]; then
+        diag_record CRITICAL "Docker container health check is unhealthy." "container=$(container_name_for_display "$container")"
+        return 1
+    elif [[ "$state" == "starting" ]]; then
+        diag_record WARN "Docker container health check is still starting." "container=$(container_name_for_display "$container")"
+    fi
+
+    return 0
 }
 
 diag_show_context() {
@@ -3673,13 +3741,17 @@ diag_show_context() {
     printf 'Source: %s\n' "$BACKUP_SOURCE_MODE"
     printf 'Engine: %s\n' "$(db_engine_label "$BACKUP_DB_TYPE")"
     if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
-        resolve_backup_executor_runtime || return 1
+        diag_resolve_docker_runtime_readonly || true
         printf 'Compose service: %s\n' "${BACKUP_DB_SERVICE:-not selected}"
-        printf 'Runtime container: %s\n' "$(container_name_for_display "$BACKUP_RUNTIME_CONTAINER")"
+        if [[ -n "${BACKUP_RUNTIME_CONTAINER:-}" ]]; then
+            printf 'Runtime container: %s\n' "$(container_name_for_display "$BACKUP_RUNTIME_CONTAINER")"
+        else
+            printf 'Runtime container: unknown\n'
+        fi
         printf 'Container state: %s\n' "${BACKUP_RUNTIME_CONTAINER_STATE:-unknown}"
-        printf 'DB image: %s\n' "${BACKUP_DOCKER_IMAGE:-$(container_image_for_display "$BACKUP_RUNTIME_CONTAINER")}"
+        printf 'DB image: %s\n' "${BACKUP_DOCKER_IMAGE:-unknown}"
         printf 'Internal endpoint: %s:%s\n' "${BACKUP_DB_HOST:-local/default}" "${BACKUP_DB_PORT:-default}"
-        if [[ -n "${BACKUP_DB_PORT:-}" ]]; then
+        if [[ -n "${BACKUP_DB_PORT:-}" && -n "${BACKUP_RUNTIME_CONTAINER:-}" ]]; then
             published_endpoint="$(docker port "$BACKUP_RUNTIME_CONTAINER" "${BACKUP_DB_PORT}/tcp" 2>/dev/null | paste -sd ',' - || true)"
             printf 'Host-published endpoint: %s\n' "${published_endpoint:-not published}"
         else
@@ -3696,7 +3768,6 @@ diag_show_context() {
 
 diag_postgres() {
     local output
-    local line
     local total max pct idle active idle_tx
 
     if output="$(diag_postgres_query 'select version()' 2>&1)"; then
@@ -3708,18 +3779,20 @@ diag_postgres() {
 
     output="$(diag_postgres_query "select count(*), current_setting('max_connections')::int, round(count(*) * 100.0 / current_setting('max_connections')::int, 1), count(*) filter (where state='idle'), count(*) filter (where state='active'), count(*) filter (where state like 'idle in transaction%') from pg_stat_activity;" 2>&1)" || {
         diag_record UNKNOWN "Could not read pg_stat_activity connection summary." "$(diag_short_query "$output")"
-        return 0
+        output=""
     }
-    IFS='|' read -r total max pct idle active idle_tx <<< "$output"
-    if [[ "${pct%.*}" =~ ^[0-9]+$ && "${pct%.*}" -ge 90 ]]; then
-        diag_record CRITICAL "Connection utilization is very high." "active=${active}, idle=${idle}, idle_in_tx=${idle_tx}, total=${total}/${max} (${pct}%)"
-    elif [[ "${pct%.*}" =~ ^[0-9]+$ && "${pct%.*}" -ge 75 ]]; then
-        diag_record WARN "Connection utilization is elevated." "active=${active}, idle=${idle}, idle_in_tx=${idle_tx}, total=${total}/${max} (${pct}%)"
-    else
-        diag_record OK "Connection utilization looks acceptable." "active=${active}, idle=${idle}, idle_in_tx=${idle_tx}, total=${total}/${max} (${pct}%)"
+    if [[ -n "$output" ]]; then
+        IFS='|' read -r total max pct idle active idle_tx <<< "$output"
+        if [[ "${pct%.*}" =~ ^[0-9]+$ && "${pct%.*}" -ge 90 ]]; then
+            diag_record CRITICAL "Connection utilization is very high." "active=${active}, idle=${idle}, idle_in_tx=${idle_tx}, total=${total}/${max} (${pct}%)"
+        elif [[ "${pct%.*}" =~ ^[0-9]+$ && "${pct%.*}" -ge 75 ]]; then
+            diag_record WARN "Connection utilization is elevated." "active=${active}, idle=${idle}, idle_in_tx=${idle_tx}, total=${total}/${max} (${pct}%)"
+        else
+            diag_record OK "Connection utilization looks acceptable." "active=${active}, idle=${idle}, idle_in_tx=${idle_tx}, total=${total}/${max} (${pct}%)"
+        fi
     fi
 
-    output="$(diag_postgres_query "select pid,usename,datname,coalesce(client_addr::text,''),state,coalesce(wait_event_type,''),coalesce(wait_event,''),extract(epoch from now()-coalesce(xact_start,query_start))::int,array_to_string(pg_blocking_pids(pid),','),left(regexp_replace(query, E'[\\n\\r\\t]+', ' ', 'g'),160) from pg_stat_activity where pid <> pg_backend_pid() and (state like 'idle in transaction%' or (state='active' and now()-query_start > (${DB_DIAG_LONG_QUERY_SECONDS} || ' seconds')::interval) or cardinality(pg_blocking_pids(pid)) > 0 or wait_event_type='Lock') order by coalesce(xact_start, query_start) nulls last limit 20;" 2>&1)" || {
+    output="$(diag_postgres_query "select pid,usename,datname,coalesce(client_addr::text,''),state,coalesce(wait_event_type,''),coalesce(wait_event,''),extract(epoch from now()-coalesce(xact_start,query_start))::int,array_to_string(pg_blocking_pids(pid),','),left(regexp_replace(query, E'[\\n\\r\\t]+', ' ', 'g'),160) from pg_stat_activity where pid <> pg_backend_pid() and (state like 'idle in transaction%' or (state='active' and now()-query_start > (${DB_DIAG_LONG_QUERY_SECONDS} || ' seconds')::interval) or coalesce(array_length(pg_blocking_pids(pid), 1), 0) > 0 or wait_event_type='Lock') order by coalesce(xact_start, query_start) nulls last limit 20;" 2>&1)" || {
         diag_record UNKNOWN "Could not inspect PostgreSQL sessions/locks." "$(diag_short_query "$output")"
         output=""
     }
@@ -3780,7 +3853,7 @@ diag_mysql_like() {
         diag_record UNKNOWN "Could not calculate ${engine} connection utilization." "PROCESS privilege or variable visibility may be restricted."
     fi
 
-    output="$(diag_mysql_query "SELECT ID,USER,DB,HOST,COMMAND,TIME,COALESCE(STATE,''),LEFT(COALESCE(INFO,''),160) FROM information_schema.PROCESSLIST WHERE COMMAND <> 'Sleep' AND TIME > ${DB_DIAG_LONG_QUERY_SECONDS} ORDER BY TIME DESC LIMIT 20;" 2>&1)" || {
+    output="$(diag_mysql_query "SELECT ID,USER,DB,HOST,COMMAND,TIME,COALESCE(STATE,''),LEFT(REPLACE(REPLACE(COALESCE(INFO,''), CHAR(10), ' '), CHAR(9), ' '),160) FROM information_schema.PROCESSLIST WHERE COMMAND <> 'Sleep' AND TIME > ${DB_DIAG_LONG_QUERY_SECONDS} ORDER BY TIME DESC LIMIT 20;" 2>&1)" || {
         diag_record UNKNOWN "Could not inspect ${engine} process list." "$(diag_short_query "$output")"
         output=""
     }
@@ -3793,7 +3866,7 @@ diag_mysql_like() {
         done <<< "$output"
     fi
 
-    output="$(diag_mysql_query "SELECT trx_mysql_thread_id,trx_state,TIMESTAMPDIFF(SECOND,trx_started,NOW()),LEFT(COALESCE(trx_query,''),160) FROM information_schema.INNODB_TRX WHERE TIMESTAMPDIFF(SECOND,trx_started,NOW()) > ${DB_DIAG_IDLE_TX_SECONDS} ORDER BY trx_started LIMIT 20;" 2>&1)" || {
+    output="$(diag_mysql_query "SELECT trx_mysql_thread_id,trx_state,TIMESTAMPDIFF(SECOND,trx_started,NOW()),LEFT(REPLACE(REPLACE(COALESCE(trx_query,''), CHAR(10), ' '), CHAR(9), ' '),160) FROM information_schema.INNODB_TRX WHERE TIMESTAMPDIFF(SECOND,trx_started,NOW()) > ${DB_DIAG_IDLE_TX_SECONDS} ORDER BY trx_started LIMIT 20;" 2>&1)" || {
         diag_record UNKNOWN "Could not inspect InnoDB transaction age." "INNODB_TRX may be unavailable or privileges may be restricted."
         output=""
     }
@@ -3807,14 +3880,14 @@ diag_mysql_like() {
     fi
 
     if [[ "$engine" == "MySQL" ]]; then
-        output="$(diag_mysql_query "SELECT r.trx_mysql_thread_id,b.trx_mysql_thread_id,TIMESTAMPDIFF(SECOND,r.trx_started,NOW()),LEFT(COALESCE(r.trx_query,''),120),LEFT(COALESCE(b.trx_query,''),120) FROM performance_schema.data_lock_waits w JOIN information_schema.INNODB_TRX r ON r.trx_id=w.REQUESTING_ENGINE_TRANSACTION_ID JOIN information_schema.INNODB_TRX b ON b.trx_id=w.BLOCKING_ENGINE_TRANSACTION_ID LIMIT 20;" 2>&1)" || {
-            output="$(diag_mysql_query "SELECT r.trx_mysql_thread_id,b.trx_mysql_thread_id,TIMESTAMPDIFF(SECOND,r.trx_wait_started,NOW()),LEFT(COALESCE(r.trx_query,''),120),LEFT(COALESCE(b.trx_query,''),120) FROM information_schema.INNODB_LOCK_WAITS w JOIN information_schema.INNODB_TRX r ON r.trx_id=w.requesting_trx_id JOIN information_schema.INNODB_TRX b ON b.trx_id=w.blocking_trx_id LIMIT 20;" 2>&1)" || {
+        output="$(diag_mysql_query "SELECT r.trx_mysql_thread_id,b.trx_mysql_thread_id,TIMESTAMPDIFF(SECOND,r.trx_started,NOW()),LEFT(REPLACE(REPLACE(COALESCE(r.trx_query,''), CHAR(10), ' '), CHAR(9), ' '),120),LEFT(REPLACE(REPLACE(COALESCE(b.trx_query,''), CHAR(10), ' '), CHAR(9), ' '),120) FROM performance_schema.data_lock_waits w JOIN information_schema.INNODB_TRX r ON r.trx_id=w.REQUESTING_ENGINE_TRANSACTION_ID JOIN information_schema.INNODB_TRX b ON b.trx_id=w.BLOCKING_ENGINE_TRANSACTION_ID LIMIT 20;" 2>&1)" || {
+            output="$(diag_mysql_query "SELECT r.trx_mysql_thread_id,b.trx_mysql_thread_id,TIMESTAMPDIFF(SECOND,r.trx_wait_started,NOW()),LEFT(REPLACE(REPLACE(COALESCE(r.trx_query,''), CHAR(10), ' '), CHAR(9), ' '),120),LEFT(REPLACE(REPLACE(COALESCE(b.trx_query,''), CHAR(10), ' '), CHAR(9), ' '),120) FROM information_schema.INNODB_LOCK_WAITS w JOIN information_schema.INNODB_TRX r ON r.trx_id=w.requesting_trx_id JOIN information_schema.INNODB_TRX b ON b.trx_id=w.blocking_trx_id LIMIT 20;" 2>&1)" || {
                 diag_record UNKNOWN "Could not inspect InnoDB lock waits." "MySQL Performance Schema lock tables or legacy InnoDB lock wait views may be unavailable or restricted."
                 output=""
             }
         }
     else
-        output="$(diag_mysql_query "SELECT r.trx_mysql_thread_id,b.trx_mysql_thread_id,TIMESTAMPDIFF(SECOND,r.trx_wait_started,NOW()),LEFT(COALESCE(r.trx_query,''),120),LEFT(COALESCE(b.trx_query,''),120) FROM information_schema.INNODB_LOCK_WAITS w JOIN information_schema.INNODB_TRX r ON r.trx_id=w.requesting_trx_id JOIN information_schema.INNODB_TRX b ON b.trx_id=w.blocking_trx_id LIMIT 20;" 2>&1)" || {
+        output="$(diag_mysql_query "SELECT r.trx_mysql_thread_id,b.trx_mysql_thread_id,TIMESTAMPDIFF(SECOND,r.trx_wait_started,NOW()),LEFT(REPLACE(REPLACE(COALESCE(r.trx_query,''), CHAR(10), ' '), CHAR(9), ' '),120),LEFT(REPLACE(REPLACE(COALESCE(b.trx_query,''), CHAR(10), ' '), CHAR(9), ' '),120) FROM information_schema.INNODB_LOCK_WAITS w JOIN information_schema.INNODB_TRX r ON r.trx_id=w.requesting_trx_id JOIN information_schema.INNODB_TRX b ON b.trx_id=w.blocking_trx_id LIMIT 20;" 2>&1)" || {
             diag_record UNKNOWN "Could not inspect InnoDB lock waits." "MariaDB InnoDB lock wait views may be unavailable or restricted."
             output=""
         }
@@ -3838,6 +3911,14 @@ diag_mysql_like() {
 
 diag_mongodb() {
     local output
+    local long_seconds="$DB_DIAG_LONG_QUERY_SECONDS"
+
+    [[ "$long_seconds" =~ ^[0-9]+$ ]] || long_seconds=300
+
+    if ! diag_mongo_shell_name >/dev/null 2>&1; then
+        diag_record UNKNOWN "MongoDB diagnostic shell is not available." "Install mongosh or mongo in the selected executor to run read-only server diagnostics."
+        return 0
+    fi
 
     if output="$(diag_mongo_eval 'var r=db.runCommand({ping:1}); if (r.ok===1) print("ok"); else printjson(r);' 2>&1)"; then
         [[ "$output" == *ok* ]] && diag_record OK "MongoDB connectivity and authentication verified." "ping=ok" || diag_record UNKNOWN "MongoDB ping returned unexpected output." "$(diag_short_query "$output")"
@@ -3860,7 +3941,7 @@ diag_mongodb() {
         fi
     fi
 
-    output="$(diag_mongo_eval 'db.getSiblingDB("admin").aggregate([{$currentOp:{allUsers:false,idleConnections:true,idleSessions:true}},{$match:{$or:[{active:true,secs_running:{$gt:300}},{waitingForLock:true},{"transaction.parameters.txnNumber":{$exists:true}}]}},{$project:{opid:1,client:1,active:1,secs_running:1,waitingForLock:1,op:1,ns:1,desc:1,command:1}},{$limit:20}]).forEach(function(o){print([o.opid||"",o.client||"",o.active,o.secs_running||0,o.waitingForLock||false,o.op||"",o.ns||"",JSON.stringify(o.command||{}).substring(0,160)].join("|"));});' 2>&1)" || {
+    output="$(diag_mongo_eval 'db.getSiblingDB("admin").aggregate([{$currentOp:{allUsers:false,idleConnections:true,idleSessions:true}},{$match:{$or:[{active:true,secs_running:{$gt:'"${long_seconds}"'}},{waitingForLock:true},{"transaction.parameters.txnNumber":{$exists:true}}]}},{$project:{opid:1,client:1,active:1,secs_running:1,waitingForLock:1,op:1,ns:1,desc:1,command:1}},{$limit:20}]).forEach(function(o){print([o.opid||"",o.client||"",o.active,o.secs_running||0,o.waitingForLock||false,o.op||"",o.ns||"",JSON.stringify(o.command||{}).substring(0,160)].join("|"));});' 2>&1)" || {
         diag_record UNKNOWN "Could not inspect MongoDB current operations." "\$currentOp may require inprog privilege or may be unsupported on this deployment."
         output=""
     }
@@ -3890,7 +3971,7 @@ diag_mongodb() {
 
 run_database_diagnostics() {
     diag_reset
-    diag_show_context || return 1
+    diag_show_context || diag_record UNKNOWN "Could not render complete diagnostic context." "Continuing with available database checks."
 
     case "$BACKUP_DB_TYPE" in
         postgresql|postgres) diag_postgres ;;
@@ -3905,6 +3986,7 @@ run_database_diagnostics() {
 
 cmd_db_diagnose() {
     local source_choice
+    local status=0
 
     require_root
     require_debian_based
@@ -3916,15 +3998,22 @@ cmd_db_diagnose() {
             "Database diagnostic target:" \
             "Docker" \
             "Native / OS"
-    )" || return 1
+    )" || {
+        BACKUP_DIAG_MODE=0
+        return 1
+    }
 
     case "$source_choice" in
-        "Docker") collect_docker_database_config || return 1 ;;
-        "Native / OS") collect_native_database_config || return 1 ;;
+        "Docker") collect_docker_database_config || status=$? ;;
+        "Native / OS") collect_native_database_config || status=$? ;;
     esac
 
-    run_database_diagnostics
+    if [[ "$status" -eq 0 ]]; then
+        run_database_diagnostics || status=$?
+    fi
+
     BACKUP_DIAG_MODE=0
+    return "$status"
 }
 
 test_database_connection() {
