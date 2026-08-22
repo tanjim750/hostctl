@@ -161,9 +161,112 @@ install_rclone() {
 install_hostctl_systemwide() {
     local source_dir
     local stage_dir
-    local old_script=""
-    local old_lib=""
-    local old_templates=""
+    local backup_dir=""
+    local required_libs=(
+        common.sh
+        init.sh
+        system.sh
+        docker.sh
+        nginx.sh
+        ssl.sh
+        firewall.sh
+        backup.sh
+        db_diagnostics.sh
+        rclone.sh
+    )
+    local install_status=0
+
+    source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+    info "Installing hostctl into ${HOSTCTL_HOME}..."
+
+    validate_hostctl_source_tree "$source_dir" || return 1
+
+    stage_dir="$(mktemp -d /tmp/hostctl-install.XXXXXX)" || {
+        error "Failed to create installation staging directory."
+        return 1
+    }
+
+    if ! cp -a "${source_dir}/hostctl.sh" "${stage_dir}/"; then
+        rm -rf "$stage_dir"
+        error "Failed to copy hostctl.sh:"
+        error "cp -a ${source_dir}/hostctl.sh ${stage_dir}/"
+        return 1
+    fi
+
+    if ! cp -a "${source_dir}/lib" "${stage_dir}/"; then
+        rm -rf "$stage_dir"
+        error "Failed to copy lib/:"
+        error "cp -a ${source_dir}/lib ${stage_dir}/"
+        return 1
+    fi
+
+    if [[ -d "${source_dir}/templates" ]]; then
+        if ! cp -a "${source_dir}/templates" "${stage_dir}/"; then
+            rm -rf "$stage_dir"
+            error "Failed to copy templates/:"
+            error "cp -a ${source_dir}/templates ${stage_dir}/"
+            return 1
+        fi
+    fi
+
+    validate_hostctl_staged_tree "$stage_dir" || {
+        rm -rf "$stage_dir"
+        return 1
+    }
+
+    chmod 755 "${stage_dir}/hostctl.sh"
+    find "${stage_dir}/lib" -type d -exec chmod 755 {} \;
+    find "${stage_dir}/lib" -type f -name "*.sh" -exec chmod 755 {} \;
+    if [[ -d "${stage_dir}/templates" ]]; then
+        find "${stage_dir}/templates" -type d -exec chmod 755 {} \;
+        find "${stage_dir}/templates" -type f -exec chmod 644 {} \;
+    fi
+
+    ensure_hostctl_runtime_layout || {
+        rm -rf "$stage_dir"
+        return 1
+    }
+
+    backup_dir="$(mktemp -d "${HOSTCTL_HOME}/tmp/install-backup.XXXXXX")" || {
+        rm -rf "$stage_dir"
+        error "Failed to create installation rollback backup directory."
+        return 1
+    }
+
+    backup_existing_hostctl_app "$backup_dir" || {
+        rm -rf "$stage_dir" "$backup_dir"
+        return 1
+    }
+
+    set +e
+    install_staged_hostctl_app "$stage_dir"
+    install_status=$?
+    set -e
+
+    if [[ "$install_status" -ne 0 ]]; then
+        rollback_hostctl_app "$backup_dir"
+        rm -rf "$stage_dir" "$backup_dir"
+        return 1
+    fi
+
+    if ! bash -n "${HOSTCTL_HOME}/hostctl.sh"; then
+        error "Installed hostctl.sh failed syntax validation after install."
+        rollback_hostctl_app "$backup_dir"
+        rm -rf "$stage_dir" "$backup_dir"
+        return 1
+    fi
+
+    rm -rf "$stage_dir" "$backup_dir"
+
+    chmod 755 "${HOSTCTL_HOME}/hostctl.sh"
+    find "${HOSTCTL_HOME}/lib" -type f -name "*.sh" -exec chmod 755 {} \;
+
+    success "hostctl application files installed."
+}
+
+validate_hostctl_source_tree() {
+    local source_dir="$1"
     local required_libs=(
         common.sh
         init.sh
@@ -177,110 +280,114 @@ install_hostctl_systemwide() {
         rclone.sh
     )
     local lib
-    local lib_file
 
-    source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-    info "Installing hostctl into ${HOSTCTL_HOME}..."
-
-    ensure_hostctl_runtime_layout || return 1
-
-    stage_dir="$(mktemp -d "${HOSTCTL_HOME}/tmp/install.XXXXXX")" || {
-        error "Failed to create installation staging directory."
+    [[ -f "${source_dir}/hostctl.sh" ]] || {
+        error "Source hostctl.sh not found: ${source_dir}/hostctl.sh"
         return 1
     }
 
-    if ! cp -a "${source_dir}/hostctl.sh" "${stage_dir}/hostctl.sh"; then
-        rm -rf "$stage_dir"
-        error "Failed to stage hostctl.sh."
+    [[ -d "${source_dir}/lib" ]] || {
+        error "Source lib/ directory not found: ${source_dir}/lib"
         return 1
-    fi
+    }
 
-    if ! mkdir -p "${stage_dir}/lib"; then
-        rm -rf "$stage_dir"
-        error "Failed to stage lib directory."
-        return 1
-    fi
-
-    for lib_file in "${source_dir}/lib/"*.sh; do
-        [[ -f "$lib_file" ]] || continue
-        cp -a "$lib_file" "${stage_dir}/lib/$(basename "$lib_file")" || {
-            rm -rf "$stage_dir"
-            error "Failed to stage library: ${lib_file}"
+    for lib in "${required_libs[@]}"; do
+        [[ -f "${source_dir}/lib/${lib}" ]] || {
+            error "Required library missing from source: ${source_dir}/lib/${lib}"
             return 1
         }
     done
+}
 
-    for lib in "${required_libs[@]}"; do
-        if [[ ! -f "${stage_dir}/lib/${lib}" ]]; then
-            rm -rf "$stage_dir"
-            error "Required library missing from source: ${source_dir}/lib/${lib}"
+validate_hostctl_staged_tree() {
+    local stage_dir="$1"
+    local file
+
+    [[ -f "${stage_dir}/hostctl.sh" ]] || {
+        error "Staged hostctl.sh missing: ${stage_dir}/hostctl.sh"
+        return 1
+    }
+
+    [[ -d "${stage_dir}/lib" ]] || {
+        error "Staged lib/ directory missing: ${stage_dir}/lib"
+        return 1
+    }
+
+    if ! bash -n "${stage_dir}/hostctl.sh"; then
+        error "Staged hostctl.sh failed syntax validation: ${stage_dir}/hostctl.sh"
+        return 1
+    fi
+
+    for file in "${stage_dir}"/lib/*.sh; do
+        [[ -f "$file" ]] || continue
+        if ! bash -n "$file"; then
+            error "Staged library failed syntax validation: $file"
             return 1
         fi
     done
+}
 
-    if [[ -d "${source_dir}/templates" ]]; then
-        cp -a "${source_dir}/templates" "${stage_dir}/templates" || {
-            rm -rf "$stage_dir"
-            error "Failed to stage templates."
-            return 1
-        }
-    fi
-
-    chmod 755 "${stage_dir}/hostctl.sh"
-    find "${stage_dir}/lib" -type d -exec chmod 755 {} \;
-    find "${stage_dir}/lib" -type f -name "*.sh" -exec chmod 755 {} \;
-    if [[ -d "${stage_dir}/templates" ]]; then
-        find "${stage_dir}/templates" -type d -exec chmod 755 {} \;
-        find "${stage_dir}/templates" -type f -exec chmod 644 {} \;
-    fi
+backup_existing_hostctl_app() {
+    local backup_dir="$1"
 
     if [[ -e "${HOSTCTL_HOME}/hostctl.sh" || -L "${HOSTCTL_HOME}/hostctl.sh" ]]; then
-        old_script="${HOSTCTL_HOME}/hostctl.sh.hostctl.prev.$$"
-        mv "${HOSTCTL_HOME}/hostctl.sh" "$old_script" || {
-            rm -rf "$stage_dir"
-            error "Failed to preserve existing hostctl.sh before update."
+        mv "${HOSTCTL_HOME}/hostctl.sh" "${backup_dir}/hostctl.sh" || {
+            error "Failed to backup existing hostctl.sh:"
+            error "mv ${HOSTCTL_HOME}/hostctl.sh ${backup_dir}/hostctl.sh"
             return 1
         }
     fi
 
     if [[ -e "${HOSTCTL_HOME}/lib" || -L "${HOSTCTL_HOME}/lib" ]]; then
-        old_lib="${HOSTCTL_HOME}/lib.hostctl.prev.$$"
-        mv "${HOSTCTL_HOME}/lib" "$old_lib" || {
-            [[ -n "$old_script" ]] && mv "$old_script" "${HOSTCTL_HOME}/hostctl.sh" 2>/dev/null || true
-            rm -rf "$stage_dir"
-            error "Failed to preserve existing lib directory before update."
+        mv "${HOSTCTL_HOME}/lib" "${backup_dir}/lib" || {
+            error "Failed to backup existing lib/:"
+            error "mv ${HOSTCTL_HOME}/lib ${backup_dir}/lib"
             return 1
         }
     fi
 
     if [[ -e "${HOSTCTL_HOME}/templates" || -L "${HOSTCTL_HOME}/templates" ]]; then
-        old_templates="${HOSTCTL_HOME}/templates.hostctl.prev.$$"
-        mv "${HOSTCTL_HOME}/templates" "$old_templates" || {
-            [[ -n "$old_lib" ]] && mv "$old_lib" "${HOSTCTL_HOME}/lib" 2>/dev/null || true
-            [[ -n "$old_script" ]] && mv "$old_script" "${HOSTCTL_HOME}/hostctl.sh" 2>/dev/null || true
-            rm -rf "$stage_dir"
-            error "Failed to preserve existing templates directory before update."
+        mv "${HOSTCTL_HOME}/templates" "${backup_dir}/templates" || {
+            error "Failed to backup existing templates/:"
+            error "mv ${HOSTCTL_HOME}/templates ${backup_dir}/templates"
             return 1
         }
     fi
+}
 
-    if ! mv "${stage_dir}/hostctl.sh" "${HOSTCTL_HOME}/hostctl.sh" ||
-       ! mv "${stage_dir}/lib" "${HOSTCTL_HOME}/lib" ||
-       { [[ ! -d "${stage_dir}/templates" ]] || mv "${stage_dir}/templates" "${HOSTCTL_HOME}/templates"; }; then
-        rm -rf "${HOSTCTL_HOME}/hostctl.sh" "${HOSTCTL_HOME}/lib" "${HOSTCTL_HOME}/templates"
-        [[ -n "$old_templates" ]] && mv "$old_templates" "${HOSTCTL_HOME}/templates" 2>/dev/null || true
-        [[ -n "$old_lib" ]] && mv "$old_lib" "${HOSTCTL_HOME}/lib" 2>/dev/null || true
-        [[ -n "$old_script" ]] && mv "$old_script" "${HOSTCTL_HOME}/hostctl.sh" 2>/dev/null || true
-        rm -rf "$stage_dir"
-        error "Failed to install staged hostctl application files."
+install_staged_hostctl_app() {
+    local stage_dir="$1"
+
+    if ! mv "${stage_dir}/hostctl.sh" "${HOSTCTL_HOME}/hostctl.sh"; then
+        error "Failed to install hostctl.sh:"
+        error "mv ${stage_dir}/hostctl.sh ${HOSTCTL_HOME}/hostctl.sh"
         return 1
     fi
 
-    rm -rf "$stage_dir"
-    rm -rf "$old_script" "$old_lib" "$old_templates" 2>/dev/null || true
+    if ! mv "${stage_dir}/lib" "${HOSTCTL_HOME}/lib"; then
+        error "Failed to install lib/:"
+        error "mv ${stage_dir}/lib ${HOSTCTL_HOME}/lib"
+        return 1
+    fi
 
-    success "hostctl application files installed."
+    if [[ -d "${stage_dir}/templates" ]]; then
+        if ! mv "${stage_dir}/templates" "${HOSTCTL_HOME}/templates"; then
+            error "Failed to install templates/:"
+            error "mv ${stage_dir}/templates ${HOSTCTL_HOME}/templates"
+            return 1
+        fi
+    fi
+}
+
+rollback_hostctl_app() {
+    local backup_dir="$1"
+
+    warning "Rolling back hostctl application files."
+    rm -rf "${HOSTCTL_HOME}/hostctl.sh" "${HOSTCTL_HOME}/lib" "${HOSTCTL_HOME}/templates"
+
+    [[ ! -e "${backup_dir}/hostctl.sh" ]] || mv "${backup_dir}/hostctl.sh" "${HOSTCTL_HOME}/hostctl.sh" || true
+    [[ ! -e "${backup_dir}/lib" ]] || mv "${backup_dir}/lib" "${HOSTCTL_HOME}/lib" || true
+    [[ ! -e "${backup_dir}/templates" ]] || mv "${backup_dir}/templates" "${HOSTCTL_HOME}/templates" || true
 }
 
 ensure_hostctl_runtime_layout() {
@@ -347,7 +454,6 @@ hostctl_command_symlink_valid() {
 
 register_hostctl_command() {
     local command_path="/usr/local/bin/hostctl"
-    local temp_link="/usr/local/bin/.hostctl.$$"
 
     info "Registering system command..."
 
@@ -366,17 +472,12 @@ register_hostctl_command() {
         fi
     fi
 
-    rm -f "$temp_link"
-    ln -s "${HOSTCTL_HOME}/hostctl.sh" "$temp_link" || {
-        error "Failed to prepare command symlink: ${temp_link}"
-        return 1
-    }
-
-    mv -Tf "$temp_link" "$command_path" || {
-        rm -f "$temp_link"
+    if ! ln -sfn "${HOSTCTL_HOME}/hostctl.sh" "$command_path"; then
+        error "Failed to register ${command_path}:"
+        error "ln -sfn ${HOSTCTL_HOME}/hostctl.sh ${command_path}"
         error "Failed to register ${command_path}."
         return 1
-    }
+    fi
 
     success "${command_path} -> ${HOSTCTL_HOME}/hostctl.sh"
 }
