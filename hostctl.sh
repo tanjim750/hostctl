@@ -156,6 +156,8 @@ Firewall:
 Database / Backup:
   --db-backup              Backup project database
   --db-restore             Restore project database
+  --db-health              Run fast read-only database health checks
+                           Supports: --profile NAME [--cron]
   --db-diagnose            Run read-only database diagnostics
   --backup-now             Run backup now
   --backup-schedule        Configure backup cron
@@ -434,6 +436,10 @@ case "$COMMAND" in
 
     --db-restore)
         cmd_db_restore "$@"
+        ;;
+
+    --db-health)
+        cmd_db_health "$@"
         ;;
 
     --db-diagnose)
