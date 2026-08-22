@@ -20,6 +20,8 @@ BACKUP_DB_SERVICE=""
 BACKUP_DOCKER_TARGET_TYPE=""
 BACKUP_DOCKER_CONTAINER=""
 BACKUP_DOCKER_IMAGE=""
+BACKUP_RUNTIME_CONTAINER=""
+BACKUP_RUNTIME_CONTAINER_STATE=""
 BACKUP_DB_HOST=""
 BACKUP_DB_PORT=""
 BACKUP_DB_NAME=""
@@ -108,6 +110,8 @@ reset_backup_config() {
     BACKUP_DOCKER_TARGET_TYPE=""
     BACKUP_DOCKER_CONTAINER=""
     BACKUP_DOCKER_IMAGE=""
+    BACKUP_RUNTIME_CONTAINER=""
+    BACKUP_RUNTIME_CONTAINER_STATE=""
     BACKUP_DB_HOST=""
     BACKUP_DB_PORT=""
     BACKUP_DB_NAME=""
@@ -468,14 +472,36 @@ select_db_type() {
     esac
 }
 
-compose_exec_all_profiles() {
+backup_compose_file_args() {
+    local compose_value="${COMPOSE_FILE:-$BACKUP_COMPOSE_FILE}"
+    local item
+    local files=()
+
+    [[ -n "$compose_value" ]] || return 1
+    compose_value="${compose_value//$'\n'/:}"
+    IFS=':' read -r -a files <<< "$compose_value"
+    for item in "${files[@]}"; do
+        [[ -n "$item" ]] && printf '%s\n' "$item"
+    done
+}
+
+backup_compose_exec() {
+    local args=(docker compose)
+    local file
+
     if [[ -n "${ENV_FILE:-}" ]]; then
-        docker compose --profile '*' --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@" 2>/dev/null ||
-            docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
-    else
-        docker compose --profile '*' -f "$COMPOSE_FILE" "$@" 2>/dev/null ||
-            docker compose -f "$COMPOSE_FILE" "$@"
+        args+=(--env-file "$ENV_FILE")
     fi
+    while IFS= read -r file; do
+        args+=(-f "$file")
+    done < <(backup_compose_file_args)
+    args+=("$@")
+    "${args[@]}"
+}
+
+compose_exec_all_profiles() {
+    backup_compose_exec --profile '*' "$@" 2>/dev/null ||
+        backup_compose_exec "$@"
 }
 
 get_all_compose_services() {
@@ -497,6 +523,17 @@ compose_service_image() {
 
     compose_service_block "$service" |
         awk '$1 == "image:" { print $2; exit }'
+}
+
+compose_service_container_name() {
+    local service="$1"
+
+    compose_service_block "$service" |
+        awk '$1 == "container_name:" { print $2; exit }'
+}
+
+compose_project_name() {
+    backup_compose_exec config --name 2>/dev/null || true
 }
 
 image_repo_name() {
@@ -551,22 +588,6 @@ detect_docker_db_type_for_service() {
     fi
 }
 
-docker_target_exec() {
-    if [[ "${BACKUP_DOCKER_TARGET_TYPE:-service}" == "container" ]]; then
-        docker exec "$BACKUP_DOCKER_CONTAINER" "$@"
-    else
-        compose_exec exec -T "$BACKUP_DB_SERVICE" "$@"
-    fi
-}
-
-docker_target_exec_input() {
-    if [[ "${BACKUP_DOCKER_TARGET_TYPE:-service}" == "container" ]]; then
-        docker exec -i "$BACKUP_DOCKER_CONTAINER" "$@"
-    else
-        compose_exec exec -T "$BACKUP_DB_SERVICE" "$@"
-    fi
-}
-
 docker_target_label() {
     if [[ "${BACKUP_DOCKER_TARGET_TYPE:-service}" == "container" ]]; then
         printf 'container: %s\n' "$BACKUP_DOCKER_CONTAINER"
@@ -575,17 +596,8 @@ docker_target_label() {
     fi
 }
 
-docker_target_image() {
-    if [[ "${BACKUP_DOCKER_TARGET_TYPE:-service}" == "container" ]]; then
-        docker inspect -f '{{.Config.Image}}' "$BACKUP_DOCKER_CONTAINER" 2>/dev/null || true
-    else
-        compose_service_image "$BACKUP_DB_SERVICE"
-    fi
-}
-
 select_custom_docker_target() {
     local target_type
-    local input
 
     target_type="$(
         select_option \
@@ -595,33 +607,214 @@ select_custom_docker_target() {
     )" || return 1
 
     case "$target_type" in
-        "Compose service")
-            while true; do
-                input="$(ask_required_input "Enter Compose service name")" || return 1
-                if get_all_compose_services | awk -v service="$input" '$0 == service { found = 1 } END { exit found ? 0 : 1 }'; then
-                    BACKUP_DOCKER_TARGET_TYPE="service"
-                    BACKUP_DB_SERVICE="$input"
-                    BACKUP_DOCKER_CONTAINER=""
-                    return 0
-                fi
-                warning "Compose service not found: ${input}"
-                confirm "Enter another service?" "yes" || return 1
-            done
+        "Compose service") select_custom_compose_service_target ;;
+        "Docker container") select_custom_container_target ;;
+    esac
+}
+
+select_numbered_container() {
+    local prompt="$1"
+    shift
+    local containers=("$@")
+    local choice
+    local container
+    local name
+    local state
+    local image
+
+    [[ "${#containers[@]}" -gt 0 ]] || return 1
+    if [[ "${#containers[@]}" -eq 1 ]]; then
+        printf '%s\n' "${containers[0]}"
+        return 0
+    fi
+
+    echo >&2
+    printf '%s\n' "$prompt" >&2
+    echo >&2
+    local i
+    for i in "${!containers[@]}"; do
+        container="${containers[$i]}"
+        name="$(docker inspect -f '{{.Name}}' "$container" 2>/dev/null | sed 's#^/##' || true)"
+        state="$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || true)"
+        image="$(docker inspect -f '{{.Config.Image}}' "$container" 2>/dev/null || true)"
+        printf '%d. %s\n' "$((i + 1))" "${name:-$container}" >&2
+        printf '   ID: %s\n' "$container" >&2
+        printf '   State: %s\n' "${state:-unknown}" >&2
+        printf '   Image: %s\n' "${image:-unknown}" >&2
+    done
+
+    while true; do
+        if [[ -r /dev/tty ]]; then
+            read -r -p "Select [1-${#containers[@]}]: " choice </dev/tty || return 1
+        else
+            read -r -p "Select [1-${#containers[@]}]: " choice || return 1
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#containers[@]} )); then
+            printf '%s\n' "${containers[$((choice - 1))]}"
+            return 0
+        fi
+        warning "Invalid selection."
+    done
+}
+
+container_health_status() {
+    local container="$1"
+
+    docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container" 2>/dev/null || true
+}
+
+container_name_for_display() {
+    local container="$1"
+    docker inspect -f '{{.Name}}' "$container" 2>/dev/null | sed 's#^/##' || printf '%s\n' "$container"
+}
+
+container_image_for_display() {
+    local container="$1"
+    docker inspect -f '{{.Config.Image}}' "$container" 2>/dev/null || true
+}
+
+resolve_compose_service_container() {
+    local service="$1"
+    local containers=()
+    local id
+    local cname
+    local project_name
+
+    while IFS= read -r id; do
+        [[ -n "$id" ]] && containers+=("$id")
+    done < <(backup_compose_exec --profile '*' ps -a -q "$service" 2>/dev/null || backup_compose_exec ps -a -q "$service" 2>/dev/null || true)
+
+    if [[ "${#containers[@]}" -eq 0 ]]; then
+        cname="$(compose_service_container_name "$service")"
+        if [[ -n "$cname" ]] && docker inspect "$cname" >/dev/null 2>&1; then
+            containers+=("$cname")
+        fi
+    fi
+
+    if [[ "${#containers[@]}" -eq 0 ]]; then
+        project_name="$(compose_project_name)"
+        if [[ -n "$project_name" ]]; then
+            while IFS= read -r id; do
+                [[ -n "$id" ]] && containers+=("$id")
+            done < <(
+                docker ps -aq \
+                    --filter "label=com.docker.compose.service=${service}" \
+                    --filter "label=com.docker.compose.project=${project_name}" \
+                    2>/dev/null || true
+            )
+        fi
+    fi
+
+    if [[ "${#containers[@]}" -eq 0 ]]; then
+        while IFS= read -r id; do
+            [[ -n "$id" ]] && containers+=("$id")
+        done < <(
+            docker ps -aq \
+                --filter "label=com.docker.compose.service=${service}" \
+                --filter "label=com.docker.compose.project.working_dir=${DOCKER_PROJECT_DIR:-$BACKUP_PROJECT_DIR}" \
+                2>/dev/null || true
+        )
+    fi
+
+    if [[ "${#containers[@]}" -eq 0 ]]; then
+        return 1
+    fi
+
+    select_numbered_container "Multiple containers match Compose service ${service}:" "${containers[@]}"
+}
+
+resolve_backup_executor_runtime() {
+    local state
+    local health
+    local container=""
+
+    [[ "$BACKUP_SOURCE_MODE" == "docker" ]] || return 0
+
+    if [[ "${BACKUP_DOCKER_TARGET_TYPE:-service}" == "container" ]]; then
+        if ! docker inspect "$BACKUP_DOCKER_CONTAINER" >/dev/null 2>&1; then
+            error "Docker container not found: ${BACKUP_DOCKER_CONTAINER}"
+            return 1
+        fi
+        container="$BACKUP_DOCKER_CONTAINER"
+    else
+        container="$(resolve_compose_service_container "$BACKUP_DB_SERVICE")" || {
+            error "No runtime container exists for Compose service: ${BACKUP_DB_SERVICE}"
+            if [[ "$BACKUP_CRON_MODE" -eq 0 ]] && confirm "Start this Compose service now?" "yes"; then
+                backup_compose_exec --profile '*' up -d "$BACKUP_DB_SERVICE" || backup_compose_exec up -d "$BACKUP_DB_SERVICE" || return 1
+                container="$(resolve_compose_service_container "$BACKUP_DB_SERVICE")" || {
+                    error "Container was not created for service: ${BACKUP_DB_SERVICE}"
+                    return 1
+                }
+            else
+                return 1
+            fi
+        }
+    fi
+
+    state="$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || true)"
+    BACKUP_RUNTIME_CONTAINER="$container"
+    BACKUP_RUNTIME_CONTAINER_STATE="$state"
+    BACKUP_DOCKER_IMAGE="$(container_image_for_display "$container")"
+
+    case "$state" in
+        running)
             ;;
-        "Docker container")
-            while true; do
-                input="$(ask_required_input "Enter Docker container name or ID")" || return 1
-                if docker inspect "$input" >/dev/null 2>&1; then
-                    BACKUP_DOCKER_TARGET_TYPE="container"
-                    BACKUP_DOCKER_CONTAINER="$input"
-                    BACKUP_DB_SERVICE=""
-                    return 0
-                fi
-                error "Docker container not found: ${input}"
-                confirm "Enter another container?" "yes" || return 1
-            done
+        exited|created)
+            warning "Docker container is ${state}: $(container_name_for_display "$container")"
+            if [[ "${BACKUP_DOCKER_TARGET_TYPE:-service}" == "service" && "$BACKUP_CRON_MODE" -eq 0 ]] && confirm "Start this Compose service now?" "yes"; then
+                backup_compose_exec --profile '*' up -d "$BACKUP_DB_SERVICE" || backup_compose_exec up -d "$BACKUP_DB_SERVICE" || return 1
+                container="$(resolve_compose_service_container "$BACKUP_DB_SERVICE")" || return 1
+                state="$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || true)"
+                BACKUP_RUNTIME_CONTAINER="$container"
+                BACKUP_RUNTIME_CONTAINER_STATE="$state"
+                BACKUP_DOCKER_IMAGE="$(container_image_for_display "$container")"
+                [[ "$state" == "running" ]] || { error "Container is still ${state:-unknown} after start."; return 1; }
+            else
+                error "Container is not running: ${state:-unknown}"
+                return 1
+            fi
+            ;;
+        restarting)
+            error "Container is restarting: $(container_name_for_display "$container")"
+            return 1
+            ;;
+        paused|removing|dead|"")
+            error "Container is not usable: ${state:-unknown}"
+            return 1
+            ;;
+        *)
+            error "Container state is not usable: ${state}"
+            return 1
             ;;
     esac
+
+    health="$(container_health_status "$container")"
+    if [[ "$health" == "unhealthy" ]]; then
+        error "Container health check is unhealthy: $(container_name_for_display "$container")"
+        return 1
+    elif [[ "$health" == "starting" ]]; then
+        warning "Container health check is still starting."
+    fi
+}
+
+docker_target_exec() {
+    [[ -n "${BACKUP_RUNTIME_CONTAINER:-}" ]] || resolve_backup_executor_runtime || return 1
+    docker exec "$BACKUP_RUNTIME_CONTAINER" "$@"
+}
+
+docker_target_exec_input() {
+    [[ -n "${BACKUP_RUNTIME_CONTAINER:-}" ]] || resolve_backup_executor_runtime || return 1
+    docker exec -i "$BACKUP_RUNTIME_CONTAINER" "$@"
+}
+
+docker_target_image() {
+    if [[ -n "${BACKUP_RUNTIME_CONTAINER:-}" ]]; then
+        container_image_for_display "$BACKUP_RUNTIME_CONTAINER"
+    elif [[ "${BACKUP_DOCKER_TARGET_TYPE:-service}" == "container" ]]; then
+        docker inspect -f '{{.Config.Image}}' "$BACKUP_DOCKER_CONTAINER" 2>/dev/null || true
+    else
+        compose_service_image "$BACKUP_DB_SERVICE"
+    fi
 }
 
 confirm_selected_docker_target() {
@@ -631,47 +824,105 @@ confirm_selected_docker_target() {
     BACKUP_DOCKER_IMAGE="$image"
 
     echo
-    echo "Selected target:"
+    echo "Selected backup executor:"
     if [[ "${BACKUP_DOCKER_TARGET_TYPE:-service}" == "container" ]]; then
         printf 'Container: %s\n' "$BACKUP_DOCKER_CONTAINER"
     else
-        printf 'Service: %s\n' "$BACKUP_DB_SERVICE"
+        printf 'Compose service: %s\n' "$BACKUP_DB_SERVICE"
     fi
     printf 'Image: %s\n' "${image:-not declared}"
     echo
 
     if [[ -n "$image" ]] && ! image_matches_db_type "$image" "$BACKUP_DB_TYPE"; then
-        warning "Selected target image does not appear to be $(db_engine_label "$BACKUP_DB_TYPE")."
-        confirm "Continue with executable/connectivity verification anyway?" "no" || return 1
+        warning "Selected executor image does not appear to be $(db_engine_label "$BACKUP_DB_TYPE")."
+        warning "This is allowed if the required client executable is present and connectivity succeeds."
+        confirm "Continue with executable/connectivity verification?" "yes" || return 1
     fi
 }
 
-select_docker_image_candidate() {
-    local candidates=("$@")
+select_docker_target_from_menu() {
+    local choices=("$@")
+    local total="${#choices[@]}"
     local choice
+    local record
+    local action
 
     while true; do
         if [[ -r /dev/tty ]]; then
-            read -r -p "Select [1-$(( ${#candidates[@]} + 4 ))]: " choice </dev/tty || return 1
+            read -r -p "Select [1-${total}]: " choice </dev/tty || return 1
         else
-            read -r -p "Select [1-$(( ${#candidates[@]} + 4 ))]: " choice || return 1
+            read -r -p "Select [1-${total}]: " choice || return 1
         fi
-        if [[ "$choice" =~ ^[0-9]+$ ]]; then
-            if (( choice >= 1 && choice <= ${#candidates[@]} )); then
-                BACKUP_DOCKER_TARGET_TYPE="service"
-                BACKUP_DB_SERVICE="${candidates[$((choice - 1))]%%|*}"
-                BACKUP_DOCKER_IMAGE="${candidates[$((choice - 1))]#*|}"
-                return 0
-            fi
-
-            case "$(( choice - ${#candidates[@]} ))" in
-                1) select_available_compose_service_target; return ;;
-                2) select_custom_docker_target; return ;;
-                3) collect_native_database_config; return ;;
-                4) return 1 ;;
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= total )); then
+            record="${choices[$((choice - 1))]}"
+            action="${record%%|*}"
+            case "$action" in
+                service)
+                    BACKUP_DOCKER_TARGET_TYPE="service"
+                    BACKUP_DB_SERVICE="${record#service|}"
+                    BACKUP_DOCKER_CONTAINER=""
+                    BACKUP_RUNTIME_CONTAINER=""
+                    return 0
+                    ;;
+                custom_service)
+                    select_custom_compose_service_target
+                    return
+                    ;;
+                custom_container)
+                    select_custom_container_target
+                    return
+                    ;;
+                native)
+                    collect_native_database_config
+                    return
+                    ;;
+                cancel)
+                    return 1
+                    ;;
             esac
         fi
         warning "Invalid selection."
+    done
+}
+
+select_custom_compose_service_target() {
+    local input
+
+    while true; do
+        input="$(ask_required_input "Enter Compose service name")" || return 1
+        if get_all_compose_services | awk -v service="$input" '$0 == service { found = 1 } END { exit found ? 0 : 1 }'; then
+            BACKUP_DOCKER_TARGET_TYPE="service"
+            BACKUP_DB_SERVICE="$input"
+            BACKUP_DOCKER_CONTAINER=""
+            BACKUP_RUNTIME_CONTAINER=""
+            return 0
+        fi
+        warning "Compose service not found: ${input}"
+        confirm "Use it anyway?" "no" && {
+            BACKUP_DOCKER_TARGET_TYPE="service"
+            BACKUP_DB_SERVICE="$input"
+            BACKUP_DOCKER_CONTAINER=""
+            BACKUP_RUNTIME_CONTAINER=""
+            return 0
+        }
+        confirm "Enter another service?" "yes" || return 1
+    done
+}
+
+select_custom_container_target() {
+    local input
+
+    while true; do
+        input="$(ask_required_input "Enter Docker container name or ID")" || return 1
+        if docker inspect "$input" >/dev/null 2>&1; then
+            BACKUP_DOCKER_TARGET_TYPE="container"
+            BACKUP_DOCKER_CONTAINER="$(container_name_for_display "$input")"
+            BACKUP_DB_SERVICE=""
+            BACKUP_RUNTIME_CONTAINER=""
+            return 0
+        fi
+        error "Docker container not found: ${input}"
+        confirm "Enter another container?" "yes" || return 1
     done
 }
 
@@ -679,7 +930,7 @@ select_available_compose_service_target() {
     local services=()
     local service
     local image
-    local choice
+    local choices=()
 
     while IFS= read -r service; do
         [[ -n "$service" ]] && services+=("$service")
@@ -699,40 +950,20 @@ select_available_compose_service_target() {
         image="$(compose_service_image "${services[$i]}")"
         printf '%d. %s\n' "$((i + 1))" "${services[$i]}"
         printf '   Image: %s\n' "${image:-not declared}"
+        choices+=("service|${services[$i]}")
     done
-    printf '%d. Custom service/container name\n' "$(( ${#services[@]} + 1 ))"
-    printf '%d. Use native/external database\n' "$(( ${#services[@]} + 2 ))"
-    printf '%d. Cancel\n' "$(( ${#services[@]} + 3 ))"
+    printf '%d. Custom Compose service\n' "$(( ${#choices[@]} + 1 ))"; choices+=("custom_service|")
+    printf '%d. Custom Docker container\n' "$(( ${#choices[@]} + 1 ))"; choices+=("custom_container|")
+    printf '%d. Use native/external database\n' "$(( ${#choices[@]} + 1 ))"; choices+=("native|")
+    printf '%d. Cancel\n' "$(( ${#choices[@]} + 1 ))"; choices+=("cancel|")
 
-    while true; do
-        if [[ -r /dev/tty ]]; then
-            read -r -p "Select [1-$(( ${#services[@]} + 3 ))]: " choice </dev/tty || return 1
-        else
-            read -r -p "Select [1-$(( ${#services[@]} + 3 ))]: " choice || return 1
-        fi
-        if [[ "$choice" =~ ^[0-9]+$ ]]; then
-            if (( choice >= 1 && choice <= ${#services[@]} )); then
-                BACKUP_DOCKER_TARGET_TYPE="service"
-                BACKUP_DB_SERVICE="${services[$((choice - 1))]}"
-                BACKUP_DOCKER_IMAGE="$(compose_service_image "$BACKUP_DB_SERVICE")"
-                return 0
-            elif (( choice == ${#services[@]} + 1 )); then
-                select_custom_docker_target
-                return
-            elif (( choice == ${#services[@]} + 2 )); then
-                collect_native_database_config
-                return
-            elif (( choice == ${#services[@]} + 3 )); then
-                return 1
-            fi
-        fi
-        warning "Invalid selection."
-    done
+    select_docker_target_from_menu "${choices[@]}"
 }
 
 select_docker_db_service() {
     local services=()
     local candidates=()
+    local choices=()
     local service
     local image
 
@@ -747,42 +978,37 @@ select_docker_db_service() {
         fi
     done
 
+    echo
+    printf '%s-compatible image candidates:\n' "$(db_engine_label "$BACKUP_DB_TYPE")"
+    echo
+    local i
     if [[ "${#candidates[@]}" -gt 0 ]]; then
-        echo
-        printf '%s-compatible image detected:\n' "$(db_engine_label "$BACKUP_DB_TYPE")"
-        echo
-        local i
         for i in "${!candidates[@]}"; do
-            printf '%d. %s\n' "$((i + 1))" "${candidates[$i]%%|*}"
+            printf '%d. %s\n' "$(( ${#choices[@]} + 1 ))" "${candidates[$i]%%|*}"
             printf '   Image: %s\n' "${candidates[$i]#*|}"
-            echo
+            choices+=("service|${candidates[$i]%%|*}")
         done
-        printf '%d. Select another available service\n' "$(( ${#candidates[@]} + 1 ))"
-        printf '%d. Enter service/container manually\n' "$(( ${#candidates[@]} + 2 ))"
-        printf '%d. Use native/external database\n' "$(( ${#candidates[@]} + 3 ))"
-        printf '%d. Cancel\n' "$(( ${#candidates[@]} + 4 ))"
-        select_docker_image_candidate "${candidates[@]}" || {
-            info "Database backup cancelled."
-            return 1
-        }
     else
         warning "No $(db_engine_label "$BACKUP_DB_TYPE")-compatible service image was detected."
-        local action
-        action="$(
-            select_option \
-                "Database execution target:" \
-                "Select from available Compose services" \
-                "Enter service/container manually" \
-                "Use native/external database" \
-                "Cancel"
-        )" || return 1
-        case "$action" in
-            "Select from available Compose services") select_available_compose_service_target ;;
-            "Enter service/container manually") select_custom_docker_target ;;
-            "Use native/external database") collect_native_database_config; return ;;
-            "Cancel") info "Database backup cancelled."; return 1 ;;
-        esac
     fi
+    echo
+    echo "All available Compose services:"
+    echo
+    for service in "${services[@]}"; do
+        image="$(compose_service_image "$service")"
+        printf '%d. %s\n' "$(( ${#choices[@]} + 1 ))" "$service"
+        printf '   Image: %s\n' "${image:-not declared}"
+        choices+=("service|${service}")
+    done
+    printf '%d. Custom Compose service\n' "$(( ${#choices[@]} + 1 ))"; choices+=("custom_service|")
+    printf '%d. Custom Docker container\n' "$(( ${#choices[@]} + 1 ))"; choices+=("custom_container|")
+    printf '%d. Use native/external database\n' "$(( ${#choices[@]} + 1 ))"; choices+=("native|")
+    printf '%d. Cancel\n' "$(( ${#choices[@]} + 1 ))"; choices+=("cancel|")
+
+    select_docker_target_from_menu "${choices[@]}" || {
+        info "Database backup cancelled."
+        return 1
+    }
 
     [[ "$BACKUP_SOURCE_MODE" == "native" ]] && return 0
     confirm_selected_docker_target
@@ -792,20 +1018,75 @@ docker_service_has_client() {
     local service="${1:-$BACKUP_DB_SERVICE}"
     local db_type="$2"
 
+    resolve_backup_executor_runtime || return 1
+
     case "$db_type" in
         postgresql|postgres)
-            docker_target_exec sh -c 'command -v pg_dump >/dev/null 2>&1'
+            docker_target_exec sh -c 'command -v pg_dump >/dev/null 2>&1' 2>/dev/null ||
+                docker_target_exec pg_dump --version >/dev/null 2>&1
             ;;
         mysql)
-            docker_target_exec sh -c 'command -v mysqldump >/dev/null 2>&1'
+            docker_target_exec sh -c 'command -v mysqldump >/dev/null 2>&1' 2>/dev/null ||
+                docker_target_exec mysqldump --version >/dev/null 2>&1
             ;;
         mariadb)
-            docker_target_exec sh -c 'command -v mariadb-dump >/dev/null 2>&1 || command -v mysqldump >/dev/null 2>&1'
+            docker_target_exec sh -c 'command -v mariadb-dump >/dev/null 2>&1 || command -v mysqldump >/dev/null 2>&1' 2>/dev/null ||
+                docker_target_exec mariadb-dump --version >/dev/null 2>&1 ||
+                docker_target_exec mysqldump --version >/dev/null 2>&1
             ;;
         mongodb)
-            docker_target_exec sh -c 'command -v mongodump >/dev/null 2>&1'
+            docker_target_exec sh -c 'command -v mongodump >/dev/null 2>&1' 2>/dev/null ||
+                docker_target_exec mongodump --version >/dev/null 2>&1
             ;;
     esac
+}
+
+docker_target_has_executable() {
+    local exe="$1"
+
+    docker_target_exec sh -c "command -v '$exe' >/dev/null 2>&1" 2>/dev/null ||
+        docker_target_exec "$exe" --version >/dev/null 2>&1 ||
+        docker_target_exec "$exe" --help >/dev/null 2>&1
+}
+
+docker_mysql_client_exec() {
+    if docker_target_has_executable mariadb; then
+        docker_target_exec mariadb "$@"
+    else
+        docker_target_exec mysql "$@"
+    fi
+}
+
+docker_mysql_client_exec_input() {
+    if docker_target_has_executable mariadb; then
+        docker_target_exec_input mariadb "$@"
+    else
+        docker_target_exec_input mysql "$@"
+    fi
+}
+
+docker_mysql_client_command_name() {
+    if docker_target_has_executable mariadb; then
+        printf 'mariadb\n'
+    else
+        printf 'mysql\n'
+    fi
+}
+
+docker_mysql_dump_exec() {
+    if [[ "$BACKUP_DB_TYPE" == "mariadb" ]] && docker_target_has_executable mariadb-dump; then
+        docker_target_exec mariadb-dump "$@"
+    else
+        docker_target_exec mysqldump "$@"
+    fi
+}
+
+docker_mysql_dump_command_name() {
+    if [[ "$BACKUP_DB_TYPE" == "mariadb" ]] && docker_target_has_executable mariadb-dump; then
+        printf 'mariadb-dump\n'
+    else
+        printf 'mysqldump\n'
+    fi
 }
 
 resolve_required_env_value() {
@@ -877,6 +1158,92 @@ default_db_port() {
         mysql|mariadb) printf '3306\n' ;;
         mongodb) printf '27017\n' ;;
     esac
+}
+
+default_docker_db_host() {
+    if [[ "${BACKUP_DOCKER_TARGET_TYPE:-service}" == "service" ]] &&
+       [[ -n "${BACKUP_DOCKER_IMAGE:-}" ]] &&
+       image_matches_db_type "$BACKUP_DOCKER_IMAGE" "$BACKUP_DB_TYPE"; then
+        printf '127.0.0.1\n'
+    elif [[ -n "$BACKUP_DB_SERVICE" ]]; then
+        printf '%s\n' "$BACKUP_DB_SERVICE"
+    else
+        printf '127.0.0.1\n'
+    fi
+}
+
+compose_service_env_files() {
+    local service="$1"
+    local line
+    local in_env_file=0
+    local value
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*env_file: ]]; then
+            in_env_file=1
+            value="${line#*:}"
+            value="$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' <<< "$value")"
+            value="${value%\"}"
+            value="${value#\"}"
+            value="${value%\'}"
+            value="${value#\'}"
+            [[ -n "$value" && "$value" != "[]" ]] && printf '%s\n' "$value"
+            continue
+        fi
+        if [[ "$in_env_file" -eq 1 ]]; then
+            if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*(.+)$ ]]; then
+                value="${BASH_REMATCH[1]}"
+                value="$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' <<< "$value")"
+                value="${value%\"}"
+                value="${value#\"}"
+                value="${value%\'}"
+                value="${value#\'}"
+                printf '%s\n' "$value"
+                continue
+            fi
+            [[ "$line" =~ ^[[:space:]]{4,} ]] || in_env_file=0
+        fi
+    done < <(compose_service_block "$service")
+}
+
+resolve_compose_relative_file() {
+    local path="$1"
+    local base="${DOCKER_PROJECT_DIR:-$BACKUP_PROJECT_DIR}"
+
+    [[ -n "$path" ]] || return 1
+    if [[ "$path" == /* ]]; then
+        printf '%s\n' "$path"
+    else
+        absolute_file_path "$path" "$base"
+    fi
+}
+
+detect_compose_service_env_file() {
+    local service="$1"
+    local candidate
+    local resolved
+
+    while IFS= read -r candidate; do
+        [[ -n "$candidate" ]] || continue
+        resolved="$(resolve_compose_relative_file "$candidate" 2>/dev/null || true)"
+        if [[ -n "$resolved" && -f "$resolved" ]]; then
+            printf '%s\n' "$resolved"
+            return 0
+        fi
+    done < <(compose_service_env_files "$service" || true)
+
+    return 1
+}
+
+backup_compose_files_exist() {
+    local file
+    local found=0
+
+    while IFS= read -r file; do
+        found=1
+        [[ -f "$file" ]] || return 1
+    done < <(backup_compose_file_args)
+    [[ "$found" -eq 1 ]]
 }
 
 resolve_optional_env_value() {
@@ -1072,15 +1439,16 @@ ensure_native_backup_client() {
 
 preflight_docker_client() {
     local db_type="$1"
-    local service="$BACKUP_DB_SERVICE"
     local action
 
-    if docker_service_has_client "$service" "$db_type"; then
+    resolve_backup_executor_runtime || return 1
+
+    if docker_service_has_client "$BACKUP_DB_SERVICE" "$db_type"; then
         return 0
     fi
 
-    error "$(backup_client_name "$db_type") is not available in service: ${service}"
-    error "This service does not appear to be a $(db_engine_label "$db_type") database backup target."
+    error "$(backup_client_name "$db_type") is not available in backup executor: $(docker_target_label)"
+    error "Executor container: $(container_name_for_display "$BACKUP_RUNTIME_CONTAINER")"
 
     if [[ "$BACKUP_CRON_MODE" -eq 1 ]]; then
         return 1
@@ -1098,10 +1466,12 @@ preflight_docker_client() {
     case "$action" in
         "Select another Compose service")
             select_available_compose_service_target || return 1
+            confirm_selected_docker_target || return 1
             preflight_docker_client "$db_type"
             ;;
         "Enter service/container manually")
             select_custom_docker_target || return 1
+            confirm_selected_docker_target || return 1
             preflight_docker_client "$db_type"
             ;;
         "Use host/native DB client")
@@ -1119,18 +1489,20 @@ preflight_postgres() {
     if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
         preflight_docker_client postgresql || return 1
         password="$(backup_password_env_prefix)"
-        if docker_target_exec sh -c 'command -v psql >/dev/null 2>&1'; then
-            if [[ -n "$password" ]]; then
-                docker_target_exec env "PGPASSWORD=${password}" psql -h "${BACKUP_DB_HOST:-localhost}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null 2>&1
-            else
-                docker_target_exec psql -h "${BACKUP_DB_HOST:-localhost}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null 2>&1
-            fi || {
-                error "PostgreSQL connectivity test failed."
-                [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
-                preflight_failure_action
-                return
-            }
-        fi
+        docker_target_has_executable psql || {
+            error "psql is required in the selected executor for PostgreSQL connectivity validation."
+            return 1
+        }
+        if [[ -n "$password" ]]; then
+            docker_target_exec env "PGPASSWORD=${password}" psql -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null
+        else
+            docker_target_exec psql -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null
+        fi || {
+            error "PostgreSQL connectivity test failed."
+            [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
+            preflight_failure_action
+            return
+        }
         return 0
     fi
 
@@ -1144,12 +1516,12 @@ preflight_postgres() {
     password="$(backup_password_env_prefix)"
     if command_exists psql; then
         if [[ -n "$password" ]]; then
-            PGPASSWORD="$password" psql -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null 2>&1 && {
+            PGPASSWORD="$password" psql -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null && {
                 success "PostgreSQL is reachable."
                 return 0
             }
         else
-            psql -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null 2>&1 && {
+            psql -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null && {
                 success "PostgreSQL is reachable."
                 return 0
             }
@@ -1165,23 +1537,27 @@ preflight_postgres() {
 preflight_mysql_like() {
     local db_type="$1"
     local client="mysql"
+    local docker_client="mysql"
     local password
 
     if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
         preflight_docker_client "$db_type" || return 1
         password="$(backup_password_env_prefix)"
-        if docker_target_exec sh -c 'command -v mariadb >/dev/null 2>&1 || command -v mysql >/dev/null 2>&1'; then
-            if [[ -n "$password" ]]; then
-                docker_target_exec env "MYSQL_PWD=${password}" sh -c 'if command -v mariadb >/dev/null 2>&1; then exec mariadb -h "$1" -P "$2" -u "$3" "$4" -e "select 1"; else exec mysql -h "$1" -P "$2" -u "$3" "$4" -e "select 1"; fi' sh "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-3306}" "$BACKUP_DB_USER" "$BACKUP_DB_NAME" >/dev/null 2>&1
-            else
-                docker_target_exec sh -c 'if command -v mariadb >/dev/null 2>&1; then exec mariadb -h "$1" -P "$2" -u "$3" "$4" -e "select 1"; else exec mysql -h "$1" -P "$2" -u "$3" "$4" -e "select 1"; fi' sh "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-3306}" "$BACKUP_DB_USER" "$BACKUP_DB_NAME" >/dev/null 2>&1
-            fi || {
-                error "$(db_engine_label "$db_type") connectivity test failed."
-                [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
-                preflight_failure_action
-                return
-            }
-        fi
+        { docker_target_has_executable mariadb || docker_target_has_executable mysql; } || {
+            error "mysql or mariadb client is required in the selected executor for connectivity validation."
+            return 1
+        }
+        docker_client="$(docker_mysql_client_command_name)"
+        if [[ -n "$password" ]]; then
+            docker_target_exec env "MYSQL_PWD=${password}" "$docker_client" -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" -e 'select 1' >/dev/null
+        else
+            docker_mysql_client_exec -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" -e 'select 1' >/dev/null
+        fi || {
+            error "$(db_engine_label "$db_type") connectivity test failed."
+            [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
+            preflight_failure_action
+            return
+        }
         return 0
     fi
 
@@ -1192,12 +1568,12 @@ preflight_mysql_like() {
     info "Checking $(db_engine_label "$db_type") connection..."
     password="$(backup_password_env_prefix)"
     if [[ -n "$password" ]]; then
-        MYSQL_PWD="$password" "$client" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" -e 'select 1' >/dev/null 2>&1 && {
+        MYSQL_PWD="$password" "$client" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" -e 'select 1' >/dev/null && {
             success "$(db_engine_label "$db_type") is reachable."
             return 0
         }
     else
-        "$client" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" -e 'select 1' >/dev/null 2>&1 && {
+        "$client" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" -e 'select 1' >/dev/null && {
             success "$(db_engine_label "$db_type") is reachable."
             return 0
         }
@@ -1224,7 +1600,7 @@ preflight_mongodb() {
         preflight_docker_client mongodb || return 1
         if docker_target_exec sh -c 'command -v mongosh >/dev/null 2>&1 || command -v mongo >/dev/null 2>&1'; then
             uri="$(mongo_connection_uri)"
-            docker_target_exec sh -c 'if command -v mongosh >/dev/null 2>&1; then mongosh "$1" --quiet --eval "db.runCommand({ ping: 1 }).ok"; else mongo "$1" --quiet --eval "db.runCommand({ ping: 1 }).ok"; fi' sh "$uri" >/dev/null 2>&1 || {
+            docker_target_exec sh -c 'if command -v mongosh >/dev/null 2>&1; then mongosh "$1" --quiet --eval "db.runCommand({ ping: 1 }).ok"; else mongo "$1" --quiet --eval "db.runCommand({ ping: 1 }).ok"; fi' sh "$uri" >/dev/null || {
                 error "MongoDB connectivity test failed."
                 [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
                 preflight_failure_action
@@ -1232,7 +1608,7 @@ preflight_mongodb() {
             }
         else
             uri="$(mongo_connection_uri)"
-            docker_target_exec mongodump --uri="$uri" --db "$BACKUP_DB_NAME" --collection "__hostctl_preflight_nonexistent__" --archive --gzip >/dev/null 2>&1 || {
+            docker_target_exec mongodump --uri="$uri" --db "$BACKUP_DB_NAME" --collection "__hostctl_preflight_nonexistent__" --archive --gzip >/dev/null || {
                 error "MongoDB connectivity test failed."
                 [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
                 preflight_failure_action
@@ -1245,21 +1621,21 @@ preflight_mongodb() {
     ensure_native_backup_client mongodb || return 1
     uri="$(mongo_connection_uri)"
     if command_exists mongosh; then
-        mongosh "$uri" --quiet --eval 'db.runCommand({ ping: 1 }).ok' >/dev/null 2>&1 || {
+        mongosh "$uri" --quiet --eval 'db.runCommand({ ping: 1 }).ok' >/dev/null || {
             error "MongoDB connectivity test failed."
             [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
             preflight_failure_action
             return
         }
     elif command_exists mongo; then
-        mongo "$uri" --quiet --eval 'db.runCommand({ ping: 1 }).ok' >/dev/null 2>&1 || {
+        mongo "$uri" --quiet --eval 'db.runCommand({ ping: 1 }).ok' >/dev/null || {
             error "MongoDB connectivity test failed."
             [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
             preflight_failure_action
             return
         }
     else
-        mongodump --uri="$uri" --db "$BACKUP_DB_NAME" --collection "__hostctl_preflight_nonexistent__" --archive=/dev/null --gzip >/dev/null 2>&1 || {
+        mongodump --uri="$uri" --db "$BACKUP_DB_NAME" --collection "__hostctl_preflight_nonexistent__" --archive=/dev/null --gzip >/dev/null || {
             error "MongoDB connectivity test failed."
             [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
             preflight_failure_action
@@ -1275,7 +1651,6 @@ preflight_failure_action() {
         select_option \
             "Connection preflight:" \
             "Edit database configuration" \
-            "Continue anyway" \
             "Cancel"
     )" || return 1
 
@@ -1286,9 +1661,6 @@ preflight_failure_action() {
             else
                 collect_native_database_config
             fi
-            ;;
-        "Continue anyway")
-            return 0
             ;;
         "Cancel")
             return 1
@@ -1308,6 +1680,10 @@ show_preflight_summary() {
             printf 'Container: %s\n' "$BACKUP_DOCKER_CONTAINER"
         else
             printf 'Service: %s\n' "$BACKUP_DB_SERVICE"
+        fi
+        if [[ -n "${BACKUP_RUNTIME_CONTAINER:-}" ]]; then
+            printf 'Runtime container: %s\n' "$(container_name_for_display "$BACKUP_RUNTIME_CONTAINER")"
+            printf 'Runtime state: %s\n' "${BACKUP_RUNTIME_CONTAINER_STATE:-unknown}"
         fi
         printf 'Image: %s\n' "${BACKUP_DOCKER_IMAGE:-not declared}"
     else
@@ -1359,6 +1735,13 @@ collect_docker_database_config() {
     BACKUP_DB_TYPE="$(select_db_type)" || return 1
     select_docker_db_service || return 1
     [[ "$BACKUP_SOURCE_MODE" == "native" ]] && return 0
+    BACKUP_DOCKER_IMAGE="$(docker_target_image)"
+
+    if [[ -z "$BACKUP_ENV_FILE" && -n "$BACKUP_DB_SERVICE" ]]; then
+        BACKUP_ENV_FILE="$(detect_compose_service_env_file "$BACKUP_DB_SERVICE" || true)"
+        ENV_FILE="$BACKUP_ENV_FILE"
+        [[ -n "$BACKUP_ENV_FILE" ]] && info "Using Compose service env_file: ${BACKUP_ENV_FILE}"
+    fi
 
     case "$BACKUP_DB_TYPE" in
         postgresql)
@@ -1391,7 +1774,7 @@ collect_docker_database_config() {
 
     BACKUP_CREDENTIAL_SOURCE="env"
 
-    resolve_optional_env_value "Database host" "$BACKUP_DB_HOST_VAR" BACKUP_DB_HOST "${BACKUP_DB_SERVICE:-localhost}" || return 1
+    resolve_optional_env_value "Database host" "$BACKUP_DB_HOST_VAR" BACKUP_DB_HOST "$(default_docker_db_host)" || return 1
     resolve_optional_env_value "Database port" "$BACKUP_DB_PORT_VAR" BACKUP_DB_PORT "$(default_db_port "$BACKUP_DB_TYPE")" || return 1
     resolve_required_env_value "Database" BACKUP_DB_NAME_VAR BACKUP_DB_NAME || return 1
     resolve_required_env_value "Database user" BACKUP_DB_USER_VAR BACKUP_DB_USER || return 1
@@ -1660,8 +2043,8 @@ collect_backup_config() {
     )" || return 1
 
     case "$source" in
-        "Docker") collect_docker_database_config ;;
-        "Native / OS") collect_native_database_config ;;
+        "Docker") collect_docker_database_config || return 1 ;;
+        "Native / OS") collect_native_database_config || return 1 ;;
     esac
 
     collect_destination_config
@@ -1673,23 +2056,38 @@ collect_backup_config() {
 
 backup_resolve_runtime_values() {
     [[ "$BACKUP_DB_TYPE" == "postgres" ]] && BACKUP_DB_TYPE="postgresql"
+    BACKUP_RUNTIME_CONTAINER=""
+    BACKUP_RUNTIME_CONTAINER_STATE=""
 
     if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
         COMPOSE_FILE="$BACKUP_COMPOSE_FILE"
         ENV_FILE="$BACKUP_ENV_FILE"
         DOCKER_PROJECT_DIR="$BACKUP_PROJECT_DIR"
 
-        if [[ ! -f "$COMPOSE_FILE" ]]; then
+        if ! backup_compose_files_exist; then
             if [[ "$BACKUP_CRON_MODE" -eq 1 ]]; then
-                error "Saved compose file does not exist: ${COMPOSE_FILE}"
+                error "One or more saved Compose files do not exist: ${COMPOSE_FILE}"
                 return 1
             fi
-            warning "Saved compose file no longer exists: ${COMPOSE_FILE}"
+            warning "Saved Compose path no longer exists: ${COMPOSE_FILE}"
             COMPOSE_FILE="$(prompt_manual_compose_file)" || return 1
             BACKUP_COMPOSE_FILE="$COMPOSE_FILE"
             DOCKER_PROJECT_DIR="$(cd "$(dirname "$COMPOSE_FILE")" && pwd -P)" || return 1
             BACKUP_PROJECT_DIR="$DOCKER_PROJECT_DIR"
             if confirm "Update saved profile with new path?" "yes"; then
+                write_backup_profile "$BACKUP_PROFILE_NAME"
+            fi
+        fi
+
+        if [[ -n "$ENV_FILE" && ! -f "$ENV_FILE" ]]; then
+            if [[ "$BACKUP_CRON_MODE" -eq 1 ]]; then
+                error "Saved environment file does not exist: ${ENV_FILE}"
+                return 1
+            fi
+            warning "Saved environment file no longer exists: ${ENV_FILE}"
+            ENV_FILE="$(prompt_manual_env_file "$DOCKER_PROJECT_DIR")" || return 1
+            BACKUP_ENV_FILE="$ENV_FILE"
+            if confirm "Update saved profile with new environment path?" "yes"; then
                 write_backup_profile "$BACKUP_PROFILE_NAME"
             fi
         fi
@@ -1814,11 +2212,11 @@ docker_dump_database_to_sql() {
             if [[ -n "$password" ]]; then
                 run_dump_command_to_file "PostgreSQL backup" "$sql_file" \
                     docker_target_exec env "PGPASSWORD=${password}" \
-                    pg_dump -h "${BACKUP_DB_HOST:-localhost}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
+                    pg_dump -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             else
                 run_dump_command_to_file "PostgreSQL backup" "$sql_file" \
                     docker_target_exec \
-                    pg_dump -h "${BACKUP_DB_HOST:-localhost}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
+                    pg_dump -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             fi
             ;;
         mysql|mariadb)
@@ -1827,11 +2225,10 @@ docker_dump_database_to_sql() {
             if [[ -n "$password" ]]; then
                 run_dump_command_to_file "MySQL/MariaDB backup" "$sql_file" \
                     docker_target_exec env "MYSQL_PWD=${password}" \
-                    sh -c "command -v mariadb-dump >/dev/null 2>&1 && exec mariadb-dump --no-tablespaces -h \"\$1\" -P \"\$2\" -u \"\$3\" \"\$4\" || exec mysqldump --no-tablespaces -h \"\$1\" -P \"\$2\" -u \"\$3\" \"\$4\"" sh "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-3306}" "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
+                    "$(docker_mysql_dump_command_name)" --no-tablespaces -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             else
                 run_dump_command_to_file "MySQL/MariaDB backup" "$sql_file" \
-                    docker_target_exec \
-                    sh -c "command -v mariadb-dump >/dev/null 2>&1 && exec mariadb-dump --no-tablespaces -h \"\$1\" -P \"\$2\" -u \"\$3\" \"\$4\" || exec mysqldump --no-tablespaces -h \"\$1\" -P \"\$2\" -u \"\$3\" \"\$4\"" sh "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-3306}" "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
+                    docker_mysql_dump_exec --no-tablespaces -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             fi
             ;;
         mongodb)
@@ -2142,7 +2539,7 @@ with_backup_lock() {
         (
             flock -n 9 || {
                 warning "Backup already running for profile: ${profile}"
-                exit 0
+                exit 75
             }
             "$@"
         ) 9>"$lock_path"
@@ -2556,19 +2953,11 @@ cmd_db_backup() {
 }
 
 test_database_connection() {
-    local temp
-
-    temp="$(mktemp)"
-    backup_resolve_runtime_values || {
-        rm -f "$temp"
-        return 1
-    }
-    if dump_database_to_sql "$temp"; then
-        rm -f "$temp"
+    BACKUP_PREFLIGHT_DONE=0
+    if preflight_database_config; then
         success "Database connection test succeeded."
         return 0
     fi
-    rm -f "$temp"
     return 1
 }
 
@@ -2632,7 +3021,7 @@ cmd_backup_now() {
         return 0
     fi
 
-    run_database_backup "one-time" || save_status=$?
+    with_backup_lock "one-time-$(sanitize_backup_name "${BACKUP_DB_NAME:-database}")" run_database_backup "one-time" || save_status=$?
 
     if [[ "$save_status" -eq 0 ]]; then
         if confirm "Save this configuration as a backup profile?" "no"; then
@@ -2793,30 +3182,30 @@ restore_database_from_file() {
             postgresql|postgres)
                 if [[ "$file" == *.gz ]]; then
                     if [[ -n "$password" ]]; then
-                        gzip -dc "$file" | docker_target_exec_input env "PGPASSWORD=${password}" psql -h "${BACKUP_DB_HOST:-localhost}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
+                        gzip -dc "$file" | docker_target_exec_input env "PGPASSWORD=${password}" psql -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
                     else
-                        gzip -dc "$file" | docker_target_exec_input psql -h "${BACKUP_DB_HOST:-localhost}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
+                        gzip -dc "$file" | docker_target_exec_input psql -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
                     fi
                 else
                     if [[ -n "$password" ]]; then
-                        docker_target_exec_input env "PGPASSWORD=${password}" psql -h "${BACKUP_DB_HOST:-localhost}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" < "$file"
+                        docker_target_exec_input env "PGPASSWORD=${password}" psql -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" < "$file"
                     else
-                        docker_target_exec_input psql -h "${BACKUP_DB_HOST:-localhost}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" < "$file"
+                        docker_target_exec_input psql -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" < "$file"
                     fi
                 fi
                 ;;
             mysql|mariadb)
                 if [[ "$file" == *.gz ]]; then
                     if [[ -n "$password" ]]; then
-                        gzip -dc "$file" | docker_target_exec_input env "MYSQL_PWD=${password}" sh -c 'command -v mariadb >/dev/null 2>&1 && exec mariadb -h "$1" -P "$2" -u "$3" "$4" || exec mysql -h "$1" -P "$2" -u "$3" "$4"' sh "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-3306}" "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
+                        gzip -dc "$file" | docker_target_exec_input env "MYSQL_PWD=${password}" "$(docker_mysql_client_command_name)" -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
                     else
-                        gzip -dc "$file" | docker_target_exec_input sh -c 'command -v mariadb >/dev/null 2>&1 && exec mariadb -h "$1" -P "$2" -u "$3" "$4" || exec mysql -h "$1" -P "$2" -u "$3" "$4"' sh "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-3306}" "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
+                        gzip -dc "$file" | docker_mysql_client_exec_input -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
                     fi
                 else
                     if [[ -n "$password" ]]; then
-                        docker_target_exec_input env "MYSQL_PWD=${password}" sh -c 'command -v mariadb >/dev/null 2>&1 && exec mariadb -h "$1" -P "$2" -u "$3" "$4" || exec mysql -h "$1" -P "$2" -u "$3" "$4"' sh "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-3306}" "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
+                        docker_target_exec_input env "MYSQL_PWD=${password}" "$(docker_mysql_client_command_name)" -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
                     else
-                        docker_target_exec_input sh -c 'command -v mariadb >/dev/null 2>&1 && exec mariadb -h "$1" -P "$2" -u "$3" "$4" || exec mysql -h "$1" -P "$2" -u "$3" "$4"' sh "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-3306}" "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
+                        docker_mysql_client_exec_input -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
                     fi
                 fi
                 ;;
@@ -2921,7 +3310,7 @@ cmd_db_restore() {
         local original_destination="$BACKUP_DESTINATION"
         BACKUP_DESTINATION="local"
         BACKUP_LOCAL_PATH="${BACKUP_DATABASE_DIR}/pre-restore"
-        if ! run_database_backup "pre-restore-$(sanitize_backup_name "$BACKUP_DB_NAME")" "pre_restore"; then
+        if ! with_backup_lock "pre-restore-$(sanitize_backup_name "$BACKUP_DB_NAME")" run_database_backup "pre-restore-$(sanitize_backup_name "$BACKUP_DB_NAME")" "pre_restore"; then
             error "Safety backup failed."
             if ! confirm "Continue without safety backup?" "no"; then
                 BACKUP_DESTINATION="$original_destination"
