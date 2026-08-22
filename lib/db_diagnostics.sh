@@ -137,6 +137,9 @@ DB_DIAGNOSTIC_STATUSES=()
 DB_DIAGNOSTIC_SUMMARIES=()
 DB_DIAGNOSTIC_DETAILS=()
 DB_DIAGNOSTIC_FIX_SUPPORTED=()
+DB_DIAGNOSTIC_FIX_TYPES=()
+DB_DIAGNOSTIC_RELATED=()
+DB_DIAGNOSTIC_LAST_ID=0
 
 health_reset() {
     DB_HEALTH_WARN_COUNT=0
@@ -152,6 +155,9 @@ health_reset() {
     DB_DIAGNOSTIC_SUMMARIES=()
     DB_DIAGNOSTIC_DETAILS=()
     DB_DIAGNOSTIC_FIX_SUPPORTED=()
+    DB_DIAGNOSTIC_FIX_TYPES=()
+    DB_DIAGNOSTIC_RELATED=()
+    DB_DIAGNOSTIC_LAST_ID=0
 }
 
 health_icon() {
@@ -175,6 +181,8 @@ health_record() {
     local label="$2"
     local detail="${3:-}"
     local detail_body="${4:-}"
+    local fix_type="${5:-}"
+    local related="${6:-}"
     local icon
     local result_id
 
@@ -191,8 +199,15 @@ health_record() {
     DB_DIAGNOSTIC_STATUSES+=("$status")
     DB_DIAGNOSTIC_SUMMARIES+=("$detail")
     DB_DIAGNOSTIC_DETAILS+=("$(diagnostic_detail_for_result "$status" "$label" "$detail" "$detail_body")")
-    DB_DIAGNOSTIC_FIX_SUPPORTED+=("0")
+    if [[ "$DB_DIAGNOSTIC_RENDER_MODE" == "diagnose" && "$status" =~ ^(WARNING|FAIL)$ && -n "$fix_type" ]]; then
+        DB_DIAGNOSTIC_FIX_SUPPORTED+=("1")
+    else
+        DB_DIAGNOSTIC_FIX_SUPPORTED+=("0")
+    fi
+    DB_DIAGNOSTIC_FIX_TYPES+=("$fix_type")
+    DB_DIAGNOSTIC_RELATED+=("$related")
     DB_DIAGNOSTIC_RESULT_COUNT=$((DB_DIAGNOSTIC_RESULT_COUNT + 1))
+    DB_DIAGNOSTIC_LAST_ID="$result_id"
 
     [[ "$DB_DIAGNOSTIC_RENDER_MODE" == "health" ]] || return 0
 
@@ -253,6 +268,33 @@ diagnostic_detail_for_result() {
             echo "- This check is not applicable or is not safely detectable for this target."
             ;;
     esac
+}
+
+diagnostic_mode_active() {
+    [[ "${DB_DIAGNOSTIC_RENDER_MODE:-health}" == "diagnose" ]]
+}
+
+diagnostic_detail_from() {
+    diagnostic_mode_active || return 0
+    "$@"
+}
+
+diagnostic_related_detail() {
+    local related="$1"
+    local ids=()
+    local id
+    local title
+
+    [[ -n "$related" ]] || return 0
+    IFS=',' read -r -a ids <<< "$related"
+
+    echo "Caused by:"
+    echo
+    for id in "${ids[@]}"; do
+        [[ "$id" =~ ^[0-9]+$ && "$id" -ge 1 && "$id" -le "$DB_DIAGNOSTIC_RESULT_COUNT" ]] || continue
+        title="${DB_DIAGNOSTIC_TITLES[$((id - 1))]}"
+        printf -- '- %s: check #%s\n' "$title" "$id"
+    done
 }
 
 health_overall() {
@@ -330,16 +372,50 @@ show_diagnostic_actions() {
     local idx
     local action
     local has_fix=0
+    local fix_type
+    local related
+    local related_ids=()
+    local valid_related=()
+    local id
+    local shown=0
 
     [[ "$DB_DIAGNOSTIC_FIX_SELECTED" =~ ^[0-9]+$ && "$DB_DIAGNOSTIC_FIX_SELECTED" -ge 1 ]] || return 0
     idx=$((DB_DIAGNOSTIC_FIX_SELECTED - 1))
     [[ "${DB_DIAGNOSTIC_FIX_SUPPORTED[$idx]:-0}" == "1" ]] && has_fix=1
+    fix_type="${DB_DIAGNOSTIC_FIX_TYPES[$idx]:-}"
+    related="${DB_DIAGNOSTIC_RELATED[$idx]:-}"
 
     echo
     echo "Possible Actions"
     echo "----------------------------------------"
     echo
-    if [[ "$has_fix" -eq 1 ]]; then
+    if [[ "$fix_type" == "related" && -n "$related" ]]; then
+        IFS=',' read -r -a related_ids <<< "$related"
+        local option_title
+
+        for id in "${related_ids[@]}"; do
+            [[ "$id" =~ ^[0-9]+$ && "$id" -ge 1 && "$id" -le "$DB_DIAGNOSTIC_RESULT_COUNT" ]] || continue
+            valid_related+=("$id")
+            option_title="${DB_DIAGNOSTIC_TITLES[$((id - 1))]}"
+            printf '%d. Fix %s\n' "$((++shown))" "$option_title"
+        done
+        if [[ "$shown" -eq 0 ]]; then
+            warning "Automatic fix unavailable."
+            echo
+        fi
+        printf '%d. Re-run diagnosis\n' "$((shown + 1))"
+        printf '%d. Exit\n' "$((shown + 2))"
+        action="$(ask_input "Select [1-$((shown + 2))]" "$((shown + 2))")" || return 0
+        if [[ "$action" =~ ^[0-9]+$ && "$action" -ge 1 && "$action" -le "$shown" ]]; then
+            id="${valid_related[$((action - 1))]}"
+            apply_diagnostic_fix "$id"
+            return $?
+        fi
+        if [[ "$action" == "$((shown + 1))" ]]; then
+            return 2
+        fi
+        return 0
+    elif [[ "$has_fix" -eq 1 ]]; then
         echo "1. Fix selected issue"
         echo "2. Re-run diagnosis"
         echo "3. Exit"
@@ -365,14 +441,500 @@ show_diagnostic_actions() {
     fi
 }
 
+diagnostic_confirm_interruption() {
+    local action="$1"
+    local target="$2"
+    local query="${3:-}"
+
+    echo
+    warning "This will interrupt a live database operation."
+    echo "Action: $action"
+    echo "Target: $target"
+    if [[ -n "$query" ]]; then
+        echo "Query/operation:"
+        echo "$(diag_short_query "$query")"
+    fi
+    echo
+    confirm "Continue with this targeted action?" "no"
+}
+
+diagnostic_select_pipe_record() {
+    local title="$1"
+    local records_text="$2"
+    local -n out_ref="$3"
+    local records=()
+    local choice
+    local i
+    local fields
+    local f1 f2 f3 f4 f5 f6 f7 f8 f9
+
+    while IFS= read -r fields; do
+        [[ -n "$fields" ]] && records+=("$fields")
+    done <<< "$records_text"
+
+    if [[ "${#records[@]}" -eq 0 ]]; then
+        warning "No fixable live target was found. The diagnostic result may already be stale."
+        return 1
+    fi
+
+    echo
+    echo "$title"
+    echo
+    for i in "${!records[@]}"; do
+        IFS='|' read -r f1 f2 f3 f4 f5 f6 f7 f8 f9 <<< "${records[$i]}"
+        printf '%d. %s\n' "$((i + 1))" "$f1"
+        [[ -n "${f2:-}" ]] && printf '   user: %s\n' "$f2"
+        [[ -n "${f3:-}" ]] && printf '   database: %s\n' "$f3"
+        [[ -n "${f4:-}" ]] && printf '   client/source: %s\n' "$f4"
+        [[ -n "${f5:-}" ]] && printf '   state: %s\n' "$f5"
+        [[ -n "${f6:-}" ]] && printf '   age: %s\n' "$f6"
+        [[ -n "${f7:-}" ]] && printf '   wait/blocker: %s\n' "$f7"
+        [[ -n "${f9:-}" ]] && printf '   query: %s\n' "$(diag_short_query "$f9")"
+        echo
+    done
+
+    choice="$(ask_input "Select [1-${#records[@]}, 0 to cancel]" "0")" || return 1
+    if [[ "$choice" == "0" ]]; then
+        return 1
+    fi
+    if [[ ! "$choice" =~ ^[0-9]+$ || "$choice" -lt 1 || "$choice" -gt "${#records[@]}" ]]; then
+        warning "Invalid selection."
+        return 1
+    fi
+
+    out_ref="${records[$((choice - 1))]}"
+}
+
+postgres_signal_privilege_hint() {
+    local output
+
+    output="$(diag_postgres_query "select case when (select rolsuper from pg_roles where rolname=current_user) or pg_has_role(current_user,'pg_signal_backend','member') then 'yes' else 'database will allow only permitted same-role targets' end;" 2>/dev/null || true)"
+    [[ -n "$output" ]] && info "PostgreSQL signal privilege: $output"
+}
+
+postgres_fix_candidates() {
+    local fix_type="$1"
+    local sql
+
+    case "$fix_type" in
+        postgres:stale)
+            sql="select pid, usename, datname, coalesce(client_addr::text,''), coalesce(state,''), coalesce(now()-xact_start, interval '0')::text, coalesce(wait_event_type || ':' || wait_event,''), array_to_string(pg_blocking_pids(pid), ','), regexp_replace(coalesce(query,''), '[[:space:]]+', ' ', 'g') from pg_stat_activity where pid <> pg_backend_pid() and backend_type='client backend' and xact_start is not null and now()-xact_start > (${DB_DIAG_IDLE_TX_SECONDS} || ' seconds')::interval order by xact_start asc limit 10;"
+            ;;
+        postgres:idle)
+            sql="select pid, usename, datname, coalesce(client_addr::text,''), coalesce(state,''), coalesce(now()-coalesce(xact_start,query_start), interval '0')::text, coalesce(wait_event_type || ':' || wait_event,''), array_to_string(pg_blocking_pids(pid), ','), regexp_replace(coalesce(query,''), '[[:space:]]+', ' ', 'g') from pg_stat_activity where pid <> pg_backend_pid() and backend_type='client backend' and state like 'idle in transaction%' and now()-coalesce(xact_start,query_start) > (${DB_DIAG_IDLE_TX_SECONDS} || ' seconds')::interval order by coalesce(xact_start,query_start) asc limit 10;"
+            ;;
+        postgres:long)
+            sql="select pid, usename, datname, coalesce(client_addr::text,''), coalesce(state,''), coalesce(now()-query_start, interval '0')::text, coalesce(wait_event_type || ':' || wait_event,''), array_to_string(pg_blocking_pids(pid), ','), regexp_replace(coalesce(query,''), '[[:space:]]+', ' ', 'g') from pg_stat_activity where pid <> pg_backend_pid() and backend_type='client backend' and state='active' and now()-query_start > (${DB_DIAG_LONG_QUERY_SECONDS} || ' seconds')::interval order by query_start asc limit 10;"
+            ;;
+        postgres:blocking)
+            sql="with blockers as (select distinct unnest(pg_blocking_pids(pid)) as pid from pg_stat_activity where pid <> pg_backend_pid()) select a.pid, a.usename, a.datname, coalesce(a.client_addr::text,''), coalesce(a.state,''), coalesce(now()-coalesce(a.xact_start,a.query_start), interval '0')::text, coalesce(a.wait_event_type || ':' || a.wait_event,''), '', regexp_replace(coalesce(a.query,''), '[[:space:]]+', ' ', 'g') from pg_stat_activity a join blockers b on a.pid=b.pid where a.pid <> pg_backend_pid() and a.backend_type='client backend' order by coalesce(a.xact_start,a.query_start) asc limit 10;"
+            ;;
+        postgres:pressure)
+            sql="select pid, usename, datname, coalesce(client_addr::text,''), coalesce(state,''), coalesce(now()-coalesce(xact_start,state_change,query_start), interval '0')::text, coalesce(wait_event_type || ':' || wait_event,''), array_to_string(pg_blocking_pids(pid), ','), regexp_replace(coalesce(query,''), '[[:space:]]+', ' ', 'g') from pg_stat_activity where pid <> pg_backend_pid() and backend_type='client backend' and state in ('idle','idle in transaction') order by coalesce(xact_start,state_change,query_start) asc limit 10;"
+            ;;
+        *) return 1 ;;
+    esac
+
+    diag_postgres_query "$sql" 2>/dev/null || true
+}
+
+postgres_pid_still_fixable() {
+    local fix_type="$1"
+    local pid="$2"
+    local condition
+    local output
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    case "$fix_type" in
+        postgres:stale)
+            condition="backend_type='client backend' and xact_start is not null and now()-xact_start > (${DB_DIAG_IDLE_TX_SECONDS} || ' seconds')::interval"
+            ;;
+        postgres:idle)
+            condition="backend_type='client backend' and state like 'idle in transaction%' and now()-coalesce(xact_start,query_start) > (${DB_DIAG_IDLE_TX_SECONDS} || ' seconds')::interval"
+            ;;
+        postgres:long)
+            condition="backend_type='client backend' and state='active' and now()-query_start > (${DB_DIAG_LONG_QUERY_SECONDS} || ' seconds')::interval"
+            ;;
+        postgres:blocking)
+            condition="backend_type='client backend' and pid in (select distinct unnest(pg_blocking_pids(pid)) from pg_stat_activity where pid <> pg_backend_pid())"
+            ;;
+        postgres:pressure)
+            condition="backend_type='client backend' and state in ('idle','idle in transaction')"
+            ;;
+        *)
+            condition="backend_type='client backend'"
+            ;;
+    esac
+    output="$(diag_postgres_query "select count(*) from pg_stat_activity where pid=${pid} and pid <> pg_backend_pid() and ${condition};" 2>/dev/null || true)"
+    [[ "$output" == "1" ]]
+}
+
+postgres_pid_exists_for_optional_escalation() {
+    local pid="$1"
+    local output
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    output="$(diag_postgres_query "select count(*) from pg_stat_activity where pid=${pid} and pid <> pg_backend_pid() and backend_type='client backend';" 2>/dev/null || true)"
+    [[ "$output" == "1" ]]
+}
+
+postgres_terminate_backend() {
+    local pid="$1"
+    local result
+
+    result="$(diag_postgres_query "select pg_terminate_backend(${pid}, 5000);" 2>&1 || true)"
+    if [[ "$result" == "t" || "$result" == "true" ]]; then
+        printf '%s\n' "$result"
+        return 0
+    fi
+
+    # Older PostgreSQL versions do not support the timeout argument.
+    result="$(diag_postgres_query "select pg_terminate_backend(${pid});" 2>&1 || true)"
+    printf '%s\n' "$result"
+    [[ "$result" == "t" || "$result" == "true" ]]
+}
+
+diagnostic_fix_postgres_session() {
+    local fix_type="$1"
+    local records selected pid user db client state age wait blockers query result
+
+    records="$(postgres_fix_candidates "$fix_type")"
+    diagnostic_select_pipe_record "Fixable PostgreSQL sessions" "$records" selected || return 0
+    IFS='|' read -r pid user db client state age wait blockers query <<< "$selected"
+    postgres_signal_privilege_hint
+    diagnostic_confirm_interruption "pg_terminate_backend($pid)" "PID ${pid}, user=${user}, db=${db}, state=${state}, age=${age}" "$query" || return 0
+
+    if ! postgres_pid_still_fixable "$fix_type" "$pid"; then
+        warning "PostgreSQL backend ${pid} no longer matches this fix condition."
+        return 0
+    fi
+
+    result="$(postgres_terminate_backend "$pid" 2>&1 || true)"
+    if [[ "$result" == "t" || "$result" == "true" ]]; then
+        success "PostgreSQL backend terminated: ${pid}"
+    else
+        error "PostgreSQL backend termination was not confirmed: $(diag_short_query "$result")"
+    fi
+}
+
+diagnostic_fix_postgres_long_query() {
+    local records selected pid user db client state age wait blockers query result
+
+    records="$(postgres_fix_candidates postgres:long)"
+    diagnostic_select_pipe_record "Fixable PostgreSQL long-running queries" "$records" selected || return 0
+    IFS='|' read -r pid user db client state age wait blockers query <<< "$selected"
+    postgres_signal_privilege_hint
+    diagnostic_confirm_interruption "pg_cancel_backend($pid)" "PID ${pid}, user=${user}, db=${db}, age=${age}" "$query" || return 0
+
+    if ! postgres_pid_still_fixable postgres:long "$pid"; then
+        warning "PostgreSQL backend ${pid} no longer matches the long-running query condition."
+        return 0
+    fi
+
+    result="$(diag_postgres_query "select pg_cancel_backend(${pid});" 2>&1 || true)"
+    if [[ "$result" == "t" || "$result" == "true" ]]; then
+        success "PostgreSQL query cancellation requested: ${pid}"
+    else
+        error "PostgreSQL query cancellation was not confirmed: $(diag_short_query "$result")"
+        return 0
+    fi
+
+    sleep 2
+    if postgres_pid_exists_for_optional_escalation "$pid" && confirm "Query/session still appears active. Terminate the backend?" "no"; then
+        result="$(postgres_terminate_backend "$pid" 2>&1 || true)"
+        [[ "$result" == "t" || "$result" == "true" ]] && success "PostgreSQL backend terminated: ${pid}" || error "PostgreSQL backend termination was not confirmed: $(diag_short_query "$result")"
+    fi
+}
+
+diagnostic_fix_postgres_blocker() {
+    local records selected pid user db client state age wait blockers query action result
+
+    records="$(postgres_fix_candidates postgres:blocking)"
+    diagnostic_select_pipe_record "Fixable PostgreSQL root blockers" "$records" selected || return 0
+    IFS='|' read -r pid user db client state age wait blockers query <<< "$selected"
+    postgres_signal_privilege_hint
+    echo "1. Cancel blocker query"
+    echo "2. Terminate blocker session"
+    echo "3. Cancel"
+    action="$(ask_input "Select [1-3]" "1")" || return 0
+    [[ "$action" == "1" || "$action" == "2" ]] || return 0
+
+    if [[ "$action" == "1" ]]; then
+        diagnostic_confirm_interruption "pg_cancel_backend($pid)" "root blocker PID ${pid}, user=${user}, db=${db}, age=${age}" "$query" || return 0
+        postgres_pid_still_fixable postgres:blocking "$pid" || { warning "PostgreSQL blocker ${pid} no longer matches the blocking condition."; return 0; }
+        result="$(diag_postgres_query "select pg_cancel_backend(${pid});" 2>&1 || true)"
+        [[ "$result" == "t" || "$result" == "true" ]] && success "PostgreSQL blocker cancellation requested: ${pid}" || error "PostgreSQL blocker cancellation was not confirmed: $(diag_short_query "$result")"
+    else
+        diagnostic_confirm_interruption "pg_terminate_backend($pid)" "root blocker PID ${pid}, user=${user}, db=${db}, age=${age}" "$query" || return 0
+        postgres_pid_still_fixable postgres:blocking "$pid" || { warning "PostgreSQL blocker ${pid} no longer matches the blocking condition."; return 0; }
+        result="$(postgres_terminate_backend "$pid" 2>&1 || true)"
+        [[ "$result" == "t" || "$result" == "true" ]] && success "PostgreSQL blocker terminated: ${pid}" || error "PostgreSQL blocker termination was not confirmed: $(diag_short_query "$result")"
+    fi
+}
+
+mysql_fix_candidates() {
+    local fix_type="$1"
+    local sql
+    local output
+
+    case "$fix_type" in
+        mysql:stale|mariadb:stale)
+            sql="SELECT p.ID, p.USER, COALESCE(p.DB,''), COALESCE(p.HOST,''), p.COMMAND, TIMESTAMPDIFF(SECOND,t.trx_started,NOW()), COALESCE(p.STATE,''), '', LEFT(REPLACE(REPLACE(COALESCE(p.INFO,t.trx_query,''), CHAR(10), ' '), CHAR(9), ' '), 160) FROM information_schema.INNODB_TRX t JOIN information_schema.PROCESSLIST p ON p.ID=t.trx_mysql_thread_id WHERE p.ID <> CONNECTION_ID() AND p.USER NOT IN ('system user','event_scheduler') AND TIMESTAMPDIFF(SECOND,t.trx_started,NOW()) > ${DB_DIAG_IDLE_TX_SECONDS} ORDER BY t.trx_started ASC LIMIT 10;"
+            ;;
+        mysql:long|mariadb:long)
+            sql="SELECT ID, USER, COALESCE(DB,''), COALESCE(HOST,''), COMMAND, TIME, COALESCE(STATE,''), '', LEFT(REPLACE(REPLACE(COALESCE(INFO,''), CHAR(10), ' '), CHAR(9), ' '), 160) FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID() AND USER NOT IN ('system user','event_scheduler') AND COMMAND <> 'Sleep' AND TIME > ${DB_DIAG_LONG_QUERY_SECONDS} ORDER BY TIME DESC LIMIT 10;"
+            ;;
+        mysql:blocking)
+            sql="SELECT DISTINCT p.ID, p.USER, COALESCE(p.DB,''), COALESCE(p.HOST,''), p.COMMAND, p.TIME, COALESCE(p.STATE,''), '', LEFT(REPLACE(REPLACE(COALESCE(p.INFO,''), CHAR(10), ' '), CHAR(9), ' '), 160) FROM performance_schema.data_lock_waits w JOIN performance_schema.data_locks bl ON w.BLOCKING_ENGINE_LOCK_ID=bl.ENGINE_LOCK_ID JOIN performance_schema.threads th ON bl.THREAD_ID=th.THREAD_ID JOIN information_schema.PROCESSLIST p ON p.ID=th.PROCESSLIST_ID WHERE p.ID <> CONNECTION_ID() AND p.USER NOT IN ('system user','event_scheduler') LIMIT 10;"
+            output="$(diag_mysql_query "$sql" 2>/dev/null | tr '\t' '|' || true)"
+            if [[ -n "$output" ]]; then
+                printf '%s\n' "$output"
+                return 0
+            fi
+            sql="SELECT DISTINCT p.ID, p.USER, COALESCE(p.DB,''), COALESCE(p.HOST,''), p.COMMAND, p.TIME, COALESCE(p.STATE,''), '', LEFT(REPLACE(REPLACE(COALESCE(p.INFO,''), CHAR(10), ' '), CHAR(9), ' '), 160) FROM information_schema.INNODB_LOCK_WAITS w JOIN information_schema.INNODB_TRX bt ON bt.trx_id=w.blocking_trx_id JOIN information_schema.PROCESSLIST p ON p.ID=bt.trx_mysql_thread_id WHERE p.ID <> CONNECTION_ID() AND p.USER NOT IN ('system user','event_scheduler') LIMIT 10;"
+            ;;
+        mariadb:blocking)
+            sql="SELECT DISTINCT p.ID, p.USER, COALESCE(p.DB,''), COALESCE(p.HOST,''), p.COMMAND, p.TIME, COALESCE(p.STATE,''), '', LEFT(REPLACE(REPLACE(COALESCE(p.INFO,''), CHAR(10), ' '), CHAR(9), ' '), 160) FROM information_schema.INNODB_LOCK_WAITS w JOIN information_schema.INNODB_TRX bt ON bt.trx_id=w.blocking_trx_id JOIN information_schema.PROCESSLIST p ON p.ID=bt.trx_mysql_thread_id WHERE p.ID <> CONNECTION_ID() AND p.USER NOT IN ('system user','event_scheduler') LIMIT 10;"
+            ;;
+        mysql:pressure|mariadb:pressure)
+            sql="SELECT ID, USER, COALESCE(DB,''), COALESCE(HOST,''), COMMAND, TIME, COALESCE(STATE,''), '', LEFT(REPLACE(REPLACE(COALESCE(INFO,''), CHAR(10), ' '), CHAR(9), ' '), 160) FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID() AND USER NOT IN ('system user','event_scheduler') AND COMMAND='Sleep' ORDER BY TIME DESC LIMIT 10;"
+            ;;
+        *) return 1 ;;
+    esac
+
+    diag_mysql_query "$sql" 2>/dev/null | tr '\t' '|' || true
+}
+
+mysql_privilege_hint() {
+    local current_user_text
+
+    current_user_text="$(diag_mysql_query "SELECT CURRENT_USER();" 2>/dev/null || true)"
+    [[ -n "$current_user_text" ]] && info "Database user: $current_user_text"
+    info "The database will enforce KILL QUERY / KILL CONNECTION privileges before any interruption is accepted."
+}
+
+mysql_session_still_fixable() {
+    local fix_type="$1"
+    local id="$2"
+    local condition
+    local output
+
+    [[ "$id" =~ ^[0-9]+$ ]] || return 1
+    case "$fix_type" in
+        mysql:stale|mariadb:stale)
+            condition="ID IN (SELECT trx_mysql_thread_id FROM information_schema.INNODB_TRX WHERE TIMESTAMPDIFF(SECOND,trx_started,NOW()) > ${DB_DIAG_IDLE_TX_SECONDS})"
+            ;;
+        mysql:long|mariadb:long)
+            condition="COMMAND <> 'Sleep' AND TIME > ${DB_DIAG_LONG_QUERY_SECONDS}"
+            ;;
+        mysql:blocking)
+            output="$(diag_mysql_query "SELECT COUNT(*) FROM performance_schema.data_lock_waits w JOIN performance_schema.data_locks bl ON w.BLOCKING_ENGINE_LOCK_ID=bl.ENGINE_LOCK_ID JOIN performance_schema.threads th ON bl.THREAD_ID=th.THREAD_ID JOIN information_schema.PROCESSLIST p ON p.ID=th.PROCESSLIST_ID WHERE p.ID=${id} AND p.ID <> CONNECTION_ID() AND p.USER NOT IN ('system user','event_scheduler');" 2>/dev/null || true)"
+            if [[ "$output" == "1" ]]; then
+                return 0
+            fi
+            condition="ID IN (SELECT bt.trx_mysql_thread_id FROM information_schema.INNODB_LOCK_WAITS w JOIN information_schema.INNODB_TRX bt ON bt.trx_id=w.blocking_trx_id)"
+            ;;
+        mariadb:blocking)
+            condition="ID IN (SELECT bt.trx_mysql_thread_id FROM information_schema.INNODB_LOCK_WAITS w JOIN information_schema.INNODB_TRX bt ON bt.trx_id=w.blocking_trx_id)"
+            ;;
+        mysql:pressure|mariadb:pressure)
+            condition="COMMAND='Sleep'"
+            ;;
+        *)
+            condition="1=1"
+            ;;
+    esac
+    output="$(diag_mysql_query "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID=${id} AND ID <> CONNECTION_ID() AND USER NOT IN ('system user','event_scheduler') AND ${condition};" 2>/dev/null || true)"
+    [[ "$output" == "1" ]]
+}
+
+mysql_kill_statement() {
+    local verb="$1"
+    local id="$2"
+
+    diag_mysql_query "KILL ${verb} ${id};" 2>&1
+}
+
+diagnostic_fix_mysql_session() {
+    local fix_type="$1"
+    local records selected id user db host command seconds state ignored query result
+
+    records="$(mysql_fix_candidates "$fix_type")"
+    diagnostic_select_pipe_record "Fixable database sessions" "$records" selected || return 0
+    IFS='|' read -r id user db host command seconds state ignored query <<< "$selected"
+    mysql_privilege_hint
+    diagnostic_confirm_interruption "KILL CONNECTION ${id}" "session ${id}, user=${user}, db=${db}, state=${state}, age=${seconds}s" "$query" || return 0
+    mysql_session_still_fixable "$fix_type" "$id" || { warning "Database session ${id} no longer matches this fix condition."; return 0; }
+
+    result="$(mysql_kill_statement CONNECTION "$id" || true)"
+    if [[ -z "$result" ]]; then
+        success "Database session termination requested: ${id}"
+    else
+        error "Database session termination returned: $(diag_short_query "$result")"
+    fi
+}
+
+diagnostic_fix_mysql_query() {
+    local fix_type="$1"
+    local records selected id user db host command seconds state ignored query result
+
+    records="$(mysql_fix_candidates "$fix_type")"
+    diagnostic_select_pipe_record "Fixable long-running queries" "$records" selected || return 0
+    IFS='|' read -r id user db host command seconds state ignored query <<< "$selected"
+    mysql_privilege_hint
+    diagnostic_confirm_interruption "KILL QUERY ${id}" "session ${id}, user=${user}, db=${db}, age=${seconds}s" "$query" || return 0
+    mysql_session_still_fixable "$fix_type" "$id" || { warning "Database session ${id} no longer matches the long-running query condition."; return 0; }
+
+    result="$(mysql_kill_statement QUERY "$id" || true)"
+    if [[ -z "$result" ]]; then
+        success "Database query cancellation requested: ${id}"
+    else
+        error "Database query cancellation returned: $(diag_short_query "$result")"
+    fi
+}
+
+diagnostic_fix_mysql_blocker() {
+    local fix_type="$1"
+    local records selected id user db host command seconds state ignored query action result
+
+    records="$(mysql_fix_candidates "$fix_type")"
+    diagnostic_select_pipe_record "Fixable blocking database sessions" "$records" selected || return 0
+    IFS='|' read -r id user db host command seconds state ignored query <<< "$selected"
+    mysql_privilege_hint
+    echo "1. Kill blocker query"
+    echo "2. Kill blocker connection"
+    echo "3. Cancel"
+    action="$(ask_input "Select [1-3]" "1")" || return 0
+    [[ "$action" == "1" || "$action" == "2" ]] || return 0
+
+    if [[ "$action" == "1" ]]; then
+        diagnostic_confirm_interruption "KILL QUERY ${id}" "blocking session ${id}, user=${user}, db=${db}" "$query" || return 0
+        mysql_session_still_fixable "$fix_type" "$id" || { warning "Database session ${id} no longer matches the blocking condition."; return 0; }
+        result="$(mysql_kill_statement QUERY "$id" || true)"
+        [[ -z "$result" ]] && success "Blocking query cancellation requested: ${id}" || error "Blocking query cancellation returned: $(diag_short_query "$result")"
+    else
+        diagnostic_confirm_interruption "KILL CONNECTION ${id}" "blocking session ${id}, user=${user}, db=${db}" "$query" || return 0
+        mysql_session_still_fixable "$fix_type" "$id" || { warning "Database session ${id} no longer matches the blocking condition."; return 0; }
+        result="$(mysql_kill_statement CONNECTION "$id" || true)"
+        [[ -z "$result" ]] && success "Blocking connection termination requested: ${id}" || error "Blocking connection termination returned: $(diag_short_query "$result")"
+    fi
+}
+
+mongo_json_string() {
+    local value="$1"
+
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/ }"
+    printf '"%s"' "$value"
+}
+
+mongo_fix_candidates() {
+    local fix_type="$1"
+    local match
+
+    case "$fix_type" in
+        mongodb:stale) match='{"transaction.parameters.txnNumber":{$exists:true},opid:{$exists:true}}' ;;
+        mongodb:long) match='{active:true,secs_running:{$gt:'"${DB_DIAG_LONG_QUERY_SECONDS}"'},opid:{$exists:true}}' ;;
+        mongodb:blocking) match='{waitingForLock:true,opid:{$exists:true}}' ;;
+        *) return 1 ;;
+    esac
+
+    diag_mongo_eval 'var ops=db.getSiblingDB("admin").aggregate([{$currentOp:{allUsers:false,idleConnections:false,idleSessions:true,localOps:true}},{$match:'"${match}"'},{$match:{desc:{$not:/^(Repl|Journal|WT|connPool|clientcursormon)/}}},{$limit:10}]).toArray(); ops.forEach(function(o){ print([String(o.opid||""), o.effectiveUsers&&o.effectiveUsers[0] ? o.effectiveUsers[0].user : "", o.ns||"", o.client||"", o.active, o.secs_running||0, o.waitingForLock||false, JSON.stringify(o.command||o.query||{}).substring(0,160)].join("|")); });' 2>/dev/null || true
+}
+
+mongo_killop_privilege_hint() {
+    local output
+
+    output="$(diag_mongo_eval 'try { var r=db.runCommand({connectionStatus:1,showPrivileges:true}); var ok=false; (r.authInfo.authenticatedUserPrivileges||[]).forEach(function(p){ (p.actions||[]).forEach(function(a){ if (a==="killop") ok=true; }); }); print(ok ? "killop privilege visible" : "killop privilege not visible; operation may still be allowed for own operations"); } catch(e) { print("privilege check unavailable: " + e.message); }' 2>/dev/null || true)"
+    [[ -n "$output" ]] && info "MongoDB privilege check: $(diag_short_query "$output")"
+}
+
+mongo_op_still_fixable() {
+    local fix_type="$1"
+    local opid="$2"
+    local op_literal
+    local extra_match
+    local output
+
+    if [[ "$opid" =~ ^[0-9]+$ ]]; then
+        op_literal="$opid"
+    else
+        op_literal="$(mongo_json_string "$opid")"
+    fi
+    case "$fix_type" in
+        mongodb:stale) extra_match=',"transaction.parameters.txnNumber":{$exists:true}' ;;
+        mongodb:long) extra_match=',active:true,secs_running:{$gt:'"${DB_DIAG_LONG_QUERY_SECONDS}"'}' ;;
+        mongodb:blocking) extra_match=',waitingForLock:true' ;;
+        *) extra_match='' ;;
+    esac
+    output="$(diag_mongo_eval 'var a=db.getSiblingDB("admin").aggregate([{$currentOp:{allUsers:false,idleConnections:false,idleSessions:true,localOps:true}},{$match:{opid:'"${op_literal}${extra_match}"'}}]).toArray(); print(a.length);' 2>/dev/null || true)"
+    [[ "$output" =~ ^[1-9][0-9]*$ ]]
+}
+
+diagnostic_fix_mongodb_operation() {
+    local fix_type="$1"
+    local records selected opid user ns client active seconds waiting operation op_literal result
+
+    records="$(mongo_fix_candidates "$fix_type")"
+    diagnostic_select_pipe_record "Fixable MongoDB operations" "$records" selected || return 0
+    IFS='|' read -r opid user ns client active seconds waiting operation <<< "$selected"
+    mongo_killop_privilege_hint
+    diagnostic_confirm_interruption "db.adminCommand({killOp:1, op:<selected opid>})" "opid=${opid}, user=${user:-unknown}, ns=${ns:-unknown}, age=${seconds}s" "$operation" || return 0
+    mongo_op_still_fixable "$fix_type" "$opid" || { warning "MongoDB operation ${opid} no longer matches this fix condition."; return 0; }
+
+    if [[ "$opid" =~ ^[0-9]+$ ]]; then
+        op_literal="$opid"
+    else
+        op_literal="$(mongo_json_string "$opid")"
+    fi
+    result="$(diag_mongo_eval 'var r=db.adminCommand({killOp:1,op:'"${op_literal}"',comment:"hostctl targeted diagnostic remediation"}); printjson(r);' 2>&1 || true)"
+    if [[ "$result" == *'"ok" : 1'* || "$result" == *"ok: 1"* ]]; then
+        success "MongoDB operation interruption requested: ${opid}"
+    else
+        error "MongoDB operation interruption was not confirmed: $(diag_short_query "$result")"
+    fi
+}
+
 apply_diagnostic_fix() {
     local selected="$1"
+    local idx=$((selected - 1))
+    local fix_type="${DB_DIAGNOSTIC_FIX_TYPES[$idx]:-}"
 
-    warning "Automatic fix unavailable for selected check ${selected}."
+    case "$fix_type" in
+        postgres:stale|postgres:idle|postgres:pressure)
+            diagnostic_fix_postgres_session "$fix_type"
+            ;;
+        postgres:long)
+            diagnostic_fix_postgres_long_query
+            ;;
+        postgres:blocking)
+            diagnostic_fix_postgres_blocker
+            ;;
+        mysql:stale|mariadb:stale|mysql:pressure|mariadb:pressure)
+            diagnostic_fix_mysql_session "$fix_type"
+            ;;
+        mysql:long|mariadb:long)
+            diagnostic_fix_mysql_query "$fix_type"
+            ;;
+        mysql:blocking|mariadb:blocking)
+            diagnostic_fix_mysql_blocker "$fix_type"
+            ;;
+        mongodb:long|mongodb:blocking|mongodb:stale)
+            diagnostic_fix_mongodb_operation "$fix_type"
+            ;;
+        *)
+            warning "Automatic fix unavailable for selected check ${selected}."
+            echo
+            echo "Recommended:"
+            echo "Inspect the reported database session, lock, or runtime condition manually."
+            return 0
+            ;;
+    esac
+
     echo
-    echo "Recommended:"
-    echo "Inspect the reported database session, lock, or runtime condition manually."
-    return 0
+    echo "Re-running diagnosis..."
+    return 2
 }
 
 diagnostic_detail_loop() {
@@ -632,7 +1194,8 @@ health_postgres() {
     local output
     local total max pct idle active idle_tx
     local stale idle_tx_count old_tx long_count lock_count deadlocks role size
-    local lock_details
+    local lock_details pressure_details
+    local cause_ids=""
 
     health_check_backup_tool
 
@@ -656,9 +1219,13 @@ health_postgres() {
     if [[ -n "$output" ]]; then
         IFS='|' read -r total max pct idle active idle_tx <<< "$output"
         if [[ "${pct%.*}" =~ ^[0-9]+$ && "${pct%.*}" -ge 95 ]]; then
-            health_record FAIL "Connection utilization failed" "total=${total}/${max} (${pct}%)"
+            pressure_details="$(diagnostic_detail_from postgres_fix_candidates postgres:pressure)"
+            health_record FAIL "Connection utilization failed" "total=${total}/${max} (${pct}%)" "$pressure_details" "postgres:pressure"
+            cause_ids="${cause_ids}${cause_ids:+,}${DB_DIAGNOSTIC_LAST_ID}"
         elif [[ "${pct%.*}" =~ ^[0-9]+$ && "${pct%.*}" -ge 75 ]]; then
-            health_record WARNING "Connection utilization warning" "total=${total}/${max} (${pct}%)"
+            pressure_details="$(diagnostic_detail_from postgres_fix_candidates postgres:pressure)"
+            health_record WARNING "Connection utilization warning" "total=${total}/${max} (${pct}%)" "$pressure_details" "postgres:pressure"
+            cause_ids="${cause_ids}${cause_ids:+,}${DB_DIAGNOSTIC_LAST_ID}"
         else
             health_record PASS "Connection utilization passed" "total=${total}/${max} (${pct}%)"
         fi
@@ -672,10 +1239,12 @@ health_postgres() {
     stale="$(diag_postgres_query "select count(*) from pg_stat_activity where pid <> pg_backend_pid() and xact_start is not null and now()-xact_start > (${DB_DIAG_IDLE_TX_SECONDS} || ' seconds')::interval;" 2>/dev/null || true)"
     old_tx="$(diag_postgres_query "select count(*) from pg_stat_activity where pid <> pg_backend_pid() and xact_start is not null and now()-xact_start > '1 hour'::interval;" 2>/dev/null || true)"
     if [[ "$old_tx" =~ ^[0-9]+$ && "$old_tx" -gt 0 ]]; then
-        health_record FAIL "Stale transactions failed" "${old_tx} extremely old transaction(s)" "$(diag_postgres_stale_transaction_details)"
+        health_record FAIL "Stale transactions failed" "${old_tx} extremely old transaction(s)" "$(diagnostic_detail_from diag_postgres_stale_transaction_details)" "postgres:stale"
+        cause_ids="${cause_ids}${cause_ids:+,}${DB_DIAGNOSTIC_LAST_ID}"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$stale" =~ ^[0-9]+$ && "$stale" -gt 0 ]]; then
-        health_record WARNING "Stale transactions warning" "${stale} detected" "$(diag_postgres_stale_transaction_details)"
+        health_record WARNING "Stale transactions warning" "${stale} detected" "$(diagnostic_detail_from diag_postgres_stale_transaction_details)" "postgres:stale"
+        cause_ids="${cause_ids}${cause_ids:+,}${DB_DIAGNOSTIC_LAST_ID}"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$stale" =~ ^[0-9]+$ ]]; then
         health_record PASS "Stale transactions passed"
@@ -685,7 +1254,8 @@ health_postgres() {
 
     idle_tx_count="$(diag_postgres_query "select count(*) from pg_stat_activity where pid <> pg_backend_pid() and state like 'idle in transaction%' and now()-coalesce(xact_start,query_start) > (${DB_DIAG_IDLE_TX_SECONDS} || ' seconds')::interval;" 2>/dev/null || true)"
     if [[ "$idle_tx_count" =~ ^[0-9]+$ && "$idle_tx_count" -gt 0 ]]; then
-        health_record WARNING "Idle-in-transaction warning" "${idle_tx_count} detected" "$(diag_postgres_idle_transaction_details)"
+        health_record WARNING "Idle-in-transaction warning" "${idle_tx_count} detected" "$(diagnostic_detail_from diag_postgres_idle_transaction_details)" "postgres:idle"
+        cause_ids="${cause_ids}${cause_ids:+,}${DB_DIAGNOSTIC_LAST_ID}"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$idle_tx_count" =~ ^[0-9]+$ ]]; then
         health_record PASS "Idle-in-transaction passed"
@@ -695,7 +1265,8 @@ health_postgres() {
 
     long_count="$(diag_postgres_query "select count(*) from pg_stat_activity where pid <> pg_backend_pid() and state='active' and now()-query_start > (${DB_DIAG_LONG_QUERY_SECONDS} || ' seconds')::interval;" 2>/dev/null || true)"
     if [[ "$long_count" =~ ^[0-9]+$ && "$long_count" -gt 0 ]]; then
-        health_record WARNING "Long-running queries warning" "${long_count} detected" "$(diag_postgres_long_query_details)"
+        health_record WARNING "Long-running queries warning" "${long_count} detected" "$(diagnostic_detail_from diag_postgres_long_query_details)" "postgres:long"
+        cause_ids="${cause_ids}${cause_ids:+,}${DB_DIAGNOSTIC_LAST_ID}"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$long_count" =~ ^[0-9]+$ ]]; then
         health_record PASS "Long-running queries passed"
@@ -705,10 +1276,11 @@ health_postgres() {
 
     lock_count="$(diag_postgres_query "select count(*) from pg_stat_activity where pid <> pg_backend_pid() and (coalesce(array_length(pg_blocking_pids(pid), 1), 0) > 0 or wait_event_type='Lock');" 2>/dev/null || true)"
     if [[ "$lock_count" =~ ^[0-9]+$ && "$lock_count" -gt 0 ]]; then
-        lock_details="$(diag_postgres_lock_details)"
-        health_record FAIL "Blocking sessions failed" "${lock_count} blocked/waiting session(s)" "$lock_details"
-        health_record FAIL "Blocking chains failed" "active blockers detected" "$lock_details"
-        health_record FAIL "Lock waits failed" "${lock_count} detected" "$lock_details"
+        lock_details="$(diagnostic_detail_from diag_postgres_lock_details)"
+        health_record FAIL "Blocking sessions failed" "${lock_count} blocked/waiting session(s)" "$lock_details" "postgres:blocking"
+        cause_ids="${cause_ids}${cause_ids:+,}${DB_DIAGNOSTIC_LAST_ID}"
+        health_record FAIL "Blocking chains failed" "active blockers detected" "$lock_details" "postgres:blocking"
+        health_record FAIL "Lock waits failed" "${lock_count} detected" "$lock_details" "postgres:blocking"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$lock_count" =~ ^[0-9]+$ ]]; then
         health_record PASS "Blocking sessions passed"
@@ -730,7 +1302,7 @@ health_postgres() {
     [[ -n "$role" ]] && health_record PASS "Replication/role check passed" "in_recovery=${role}" || health_record UNKNOWN "Replication/role check unknown" "role check unavailable"
 
     if [[ "$DB_HEALTH_BACKUP_RISK" -eq 1 ]]; then
-        health_record WARNING "Backup readiness warning" "current transactions/locks may interfere"
+        health_record WARNING "Backup readiness warning" "current transactions/locks may interfere" "$(diagnostic_detail_from diagnostic_related_detail "$cause_ids")" "related" "$cause_ids"
     else
         health_record PASS "Backup readiness passed"
     fi
@@ -739,9 +1311,15 @@ health_postgres() {
 health_mysql_like() {
     local engine="$1"
     local output total sleep_count active_count max_conn pct stale lock_waits long_count deadlock_text db_size
-    local lock_details stale_details
+    local lock_details stale_details pressure_details long_details
+    local fix_prefix cause_ids=""
 
     health_check_backup_tool
+    if [[ "$engine" == "MariaDB" ]]; then
+        fix_prefix="mariadb"
+    else
+        fix_prefix="mysql"
+    fi
 
     if output="$(diag_mysql_query "SELECT 1, DATABASE();" 2>&1)"; then
         health_record PASS "Connectivity passed"
@@ -762,9 +1340,13 @@ health_mysql_like() {
     if [[ "$total" =~ ^[0-9]+$ && "$max_conn" =~ ^[0-9]+$ && "$max_conn" -gt 0 ]]; then
         pct=$(( total * 100 / max_conn ))
         if [[ "$pct" -ge 95 ]]; then
-            health_record FAIL "Connection utilization failed" "total=${total}/${max_conn} (${pct}%)"
+            pressure_details="$(diagnostic_detail_from mysql_fix_candidates "${fix_prefix}:pressure")"
+            health_record FAIL "Connection utilization failed" "total=${total}/${max_conn} (${pct}%)" "$pressure_details" "${fix_prefix}:pressure"
+            cause_ids="${cause_ids}${cause_ids:+,}${DB_DIAGNOSTIC_LAST_ID}"
         elif [[ "$pct" -ge 75 ]]; then
-            health_record WARNING "Connection utilization warning" "total=${total}/${max_conn} (${pct}%)"
+            pressure_details="$(diagnostic_detail_from mysql_fix_candidates "${fix_prefix}:pressure")"
+            health_record WARNING "Connection utilization warning" "total=${total}/${max_conn} (${pct}%)" "$pressure_details" "${fix_prefix}:pressure"
+            cause_ids="${cause_ids}${cause_ids:+,}${DB_DIAGNOSTIC_LAST_ID}"
         else
             health_record PASS "Connection utilization passed" "total=${total}/${max_conn} (${pct}%)"
         fi
@@ -780,7 +1362,9 @@ health_mysql_like() {
 
     long_count="$(diag_mysql_query "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE COMMAND <> 'Sleep' AND TIME > ${DB_DIAG_LONG_QUERY_SECONDS};" 2>/dev/null || true)"
     if [[ "$long_count" =~ ^[0-9]+$ && "$long_count" -gt 0 ]]; then
-        health_record WARNING "Long-running queries warning" "${long_count} detected" "$(diag_mysql_process_details "COMMAND <> 'Sleep' AND TIME > ${DB_DIAG_LONG_QUERY_SECONDS}")"
+        long_details="$(diagnostic_detail_from diag_mysql_process_details "COMMAND <> 'Sleep' AND TIME > ${DB_DIAG_LONG_QUERY_SECONDS}")"
+        health_record WARNING "Long-running queries warning" "${long_count} detected" "$long_details" "${fix_prefix}:long"
+        cause_ids="${cause_ids}${cause_ids:+,}${DB_DIAGNOSTIC_LAST_ID}"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$long_count" =~ ^[0-9]+$ ]]; then
         health_record PASS "Long-running queries passed"
@@ -790,9 +1374,10 @@ health_mysql_like() {
 
     stale="$(diag_mysql_query "SELECT COUNT(*) FROM information_schema.INNODB_TRX WHERE TIMESTAMPDIFF(SECOND,trx_started,NOW()) > ${DB_DIAG_IDLE_TX_SECONDS};" 2>/dev/null || true)"
     if [[ "$stale" =~ ^[0-9]+$ && "$stale" -gt 0 ]]; then
-        stale_details="$(diag_mysql_stale_transaction_details)"
-        health_record WARNING "Stale transactions warning" "${stale} detected" "$stale_details"
-        health_record WARNING "Idle-in-transaction warning" "review InnoDB transaction state" "$stale_details"
+        stale_details="$(diagnostic_detail_from diag_mysql_stale_transaction_details)"
+        health_record WARNING "Stale transactions warning" "${stale} detected" "$stale_details" "${fix_prefix}:stale"
+        cause_ids="${cause_ids}${cause_ids:+,}${DB_DIAGNOSTIC_LAST_ID}"
+        health_record WARNING "Idle-in-transaction warning" "review InnoDB transaction state" "$stale_details" "${fix_prefix}:stale"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$stale" =~ ^[0-9]+$ ]]; then
         health_record PASS "Stale transactions passed"
@@ -808,10 +1393,11 @@ health_mysql_like() {
         lock_waits="$(diag_mysql_query "SELECT COUNT(*) FROM information_schema.INNODB_LOCK_WAITS;" 2>/dev/null || true)"
     fi
     if [[ "$lock_waits" =~ ^[0-9]+$ && "$lock_waits" -gt 0 ]]; then
-        lock_details="$(diag_mysql_lock_wait_details)"
-        health_record FAIL "Blocking sessions failed" "${lock_waits} lock wait(s)" "$lock_details"
-        health_record FAIL "Blocking chains failed" "active lock waits detected" "$lock_details"
-        health_record FAIL "Lock waits failed" "${lock_waits} detected" "$lock_details"
+        lock_details="$(diagnostic_detail_from diag_mysql_lock_wait_details)"
+        health_record FAIL "Blocking sessions failed" "${lock_waits} lock wait(s)" "$lock_details" "${fix_prefix}:blocking"
+        cause_ids="${cause_ids}${cause_ids:+,}${DB_DIAGNOSTIC_LAST_ID}"
+        health_record FAIL "Blocking chains failed" "active lock waits detected" "$lock_details" "${fix_prefix}:blocking"
+        health_record FAIL "Lock waits failed" "${lock_waits} detected" "$lock_details" "${fix_prefix}:blocking"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$lock_waits" =~ ^[0-9]+$ ]]; then
         health_record PASS "Blocking sessions passed"
@@ -836,7 +1422,7 @@ health_mysql_like() {
     health_record UNSUPPORTED "Replication/role check unsupported" "not safely inferred by this health check"
 
     if [[ "$DB_HEALTH_BACKUP_RISK" -eq 1 ]]; then
-        health_record WARNING "Backup readiness warning" "current transactions/locks may interfere"
+        health_record WARNING "Backup readiness warning" "current transactions/locks may interfere" "$(diagnostic_detail_from diagnostic_related_detail "$cause_ids")" "related" "$cause_ids"
     else
         health_record PASS "Backup readiness passed"
     fi
@@ -844,7 +1430,8 @@ health_mysql_like() {
 
 health_mongodb() {
     local output current available ops locks tx repl size long_seconds
-    local lock_details
+    local lock_details op_details
+    local cause_ids=""
 
     long_seconds="$DB_DIAG_LONG_QUERY_SECONDS"
     [[ "$long_seconds" =~ ^[0-9]+$ ]] || long_seconds=300
@@ -899,7 +1486,9 @@ health_mongodb() {
     tx="$(diag_mongo_eval 'var a=db.getSiblingDB("admin").aggregate([{$currentOp:{allUsers:false,idleConnections:true,idleSessions:true}},{$match:{"transaction.parameters.txnNumber":{$exists:true}}},{$count:"n"}]).toArray(); print(a.length ? a[0].n : 0);' 2>/dev/null || true)"
 
     if [[ "$tx" =~ ^[0-9]+$ && "$tx" -gt 0 ]]; then
-        health_record WARNING "Stale transactions warning" "${tx} transaction operation(s) visible" "$(diag_mongo_currentop_details '{"transaction.parameters.txnNumber":{$exists:true}}')"
+        op_details="$(diagnostic_detail_from diag_mongo_currentop_details '{"transaction.parameters.txnNumber":{$exists:true}}')"
+        health_record WARNING "Stale transactions warning" "${tx} transaction operation(s) visible" "$op_details" "mongodb:stale"
+        cause_ids="${cause_ids}${cause_ids:+,}${DB_DIAGNOSTIC_LAST_ID}"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$tx" =~ ^[0-9]+$ ]]; then
         health_record PASS "Stale transactions passed"
@@ -909,7 +1498,9 @@ health_mongodb() {
     health_record UNSUPPORTED "Idle-in-transaction unsupported" "not a MongoDB health concept"
 
     if [[ "$ops" =~ ^[0-9]+$ && "$ops" -gt 0 ]]; then
-        health_record WARNING "Long-running operations warning" "${ops} detected" "$(diag_mongo_currentop_details '{active:true,secs_running:{$gt:'"${long_seconds}"'}}')"
+        op_details="$(diagnostic_detail_from diag_mongo_currentop_details '{active:true,secs_running:{$gt:'"${long_seconds}"'}}')"
+        health_record WARNING "Long-running operations warning" "${ops} detected" "$op_details" "mongodb:long"
+        cause_ids="${cause_ids}${cause_ids:+,}${DB_DIAGNOSTIC_LAST_ID}"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$ops" =~ ^[0-9]+$ ]]; then
         health_record PASS "Long-running operations passed"
@@ -918,10 +1509,11 @@ health_mongodb() {
     fi
 
     if [[ "$locks" =~ ^[0-9]+$ && "$locks" -gt 0 ]]; then
-        lock_details="$(diag_mongo_currentop_details '{waitingForLock:true}')"
-        health_record FAIL "Blocking sessions failed" "${locks} operation(s) waiting for lock" "$lock_details"
-        health_record FAIL "Blocking chains failed" "lock wait operations detected" "$lock_details"
-        health_record FAIL "Lock waits failed" "${locks} detected" "$lock_details"
+        lock_details="$(diagnostic_detail_from diag_mongo_currentop_details '{waitingForLock:true}')"
+        health_record FAIL "Blocking sessions failed" "${locks} operation(s) waiting for lock" "$lock_details" "mongodb:blocking"
+        cause_ids="${cause_ids}${cause_ids:+,}${DB_DIAGNOSTIC_LAST_ID}"
+        health_record FAIL "Blocking chains failed" "lock wait operations detected" "$lock_details" "mongodb:blocking"
+        health_record FAIL "Lock waits failed" "${locks} detected" "$lock_details" "mongodb:blocking"
         DB_HEALTH_BACKUP_RISK=1
     elif [[ "$locks" =~ ^[0-9]+$ ]]; then
         health_record PASS "Blocking sessions passed"
@@ -948,7 +1540,7 @@ health_mongodb() {
     fi
 
     if [[ "$DB_HEALTH_BACKUP_RISK" -eq 1 ]]; then
-        health_record WARNING "Backup readiness warning" "current operations/locks may interfere"
+        health_record WARNING "Backup readiness warning" "current operations/locks may interfere" "$(diagnostic_detail_from diagnostic_related_detail "$cause_ids")" "related" "$cause_ids"
     else
         health_record PASS "Backup readiness passed"
     fi
