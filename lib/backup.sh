@@ -6,6 +6,7 @@
 
 BACKUP_STATE_DIR="${HOSTCTL_STATE_DIR}/backups"
 BACKUP_RUN_STATE_DIR="${BACKUP_STATE_DIR}/runs"
+BACKUP_SCHEDULE_STATE_DIR="${BACKUP_STATE_DIR}/schedules"
 BACKUP_DATABASE_DIR="${HOSTCTL_BACKUP_DIR}/databases"
 BACKUP_RESTORE_TMP_DIR="${HOSTCTL_HOME}/tmp/restore"
 BACKUP_LOW_SPACE_KB="${BACKUP_LOW_SPACE_KB:-524288}"
@@ -40,6 +41,8 @@ BACKUP_LOCAL_RETENTION_DAYS=""
 BACKUP_RCLONE_REMOTE=""
 BACKUP_RCLONE_PATH=""
 BACKUP_CRON_MODE=0
+BACKUP_SCHEDULE_CONFIG_NAME=""
+BACKUP_CRON_EXPR=""
 BACKUP_RUNTIME_PASSWORD=""
 BACKUP_LAST_LOCAL_FILE=""
 BACKUP_LAST_SIZE=""
@@ -47,6 +50,7 @@ BACKUP_LAST_REMOTE_RESULT=""
 BACKUP_LAST_RESULT=""
 BACKUP_LAST_ERROR=""
 BACKUP_PREFLIGHT_DONE=0
+BACKUP_RESTORE_SAFETY_FILE=""
 
 # ---------------------------------------------------------
 # Common helpers
@@ -56,11 +60,12 @@ ensure_backup_dirs() {
     mkdir -p \
         "$BACKUP_STATE_DIR" \
         "$BACKUP_RUN_STATE_DIR" \
+        "$BACKUP_SCHEDULE_STATE_DIR" \
         "$BACKUP_DATABASE_DIR" \
         "$BACKUP_RESTORE_TMP_DIR" \
         "$HOSTCTL_LOG_DIR"
 
-    chmod 700 "$BACKUP_STATE_DIR" "$BACKUP_RUN_STATE_DIR" "$BACKUP_DATABASE_DIR" "$BACKUP_RESTORE_TMP_DIR" 2>/dev/null || true
+    chmod 700 "$BACKUP_STATE_DIR" "$BACKUP_RUN_STATE_DIR" "$BACKUP_SCHEDULE_STATE_DIR" "$BACKUP_DATABASE_DIR" "$BACKUP_RESTORE_TMP_DIR" 2>/dev/null || true
 }
 
 sanitize_backup_name() {
@@ -99,6 +104,14 @@ backup_run_state_path() {
     printf '%s/%s.state\n' "$BACKUP_RUN_STATE_DIR" "$1"
 }
 
+backup_schedule_path() {
+    valid_profile_name "$1" || {
+        error "Invalid backup profile name: $1"
+        return 1
+    }
+    printf '%s/%s.conf\n' "$BACKUP_SCHEDULE_STATE_DIR" "$1"
+}
+
 reset_backup_config() {
     BACKUP_PROFILE_NAME=""
     BACKUP_SOURCE_MODE=""
@@ -129,6 +142,8 @@ reset_backup_config() {
     BACKUP_LOCAL_RETENTION_DAYS=""
     BACKUP_RCLONE_REMOTE=""
     BACKUP_RCLONE_PATH=""
+    BACKUP_SCHEDULE_CONFIG_NAME=""
+    BACKUP_CRON_EXPR=""
     BACKUP_RUNTIME_PASSWORD=""
     BACKUP_LAST_LOCAL_FILE=""
     BACKUP_LAST_SIZE=""
@@ -359,11 +374,6 @@ write_backup_profile() {
         printf 'DB_PORT_VAR=%s\n' "$BACKUP_DB_PORT_VAR"
         printf 'MONGO_URI_VAR=%s\n' "$BACKUP_MONGO_URI_VAR"
         printf 'CREDENTIAL_SOURCE=%s\n' "$BACKUP_CREDENTIAL_SOURCE"
-        printf 'DESTINATION=%s\n' "$BACKUP_DESTINATION"
-        printf 'LOCAL_PATH=%s\n' "$BACKUP_LOCAL_PATH"
-        printf 'LOCAL_RETENTION_DAYS=%s\n' "$BACKUP_LOCAL_RETENTION_DAYS"
-        printf 'RCLONE_REMOTE=%s\n' "$BACKUP_RCLONE_REMOTE"
-        printf 'RCLONE_PATH=%s\n' "$BACKUP_RCLONE_PATH"
     } > "$path"
 
     chmod 600 "$path"
@@ -422,11 +432,76 @@ backup_profile_value() {
     return 1
 }
 
+backup_config_file_value() {
+    local path="$1"
+    local wanted_key="$2"
+    local line
+    local key
+    local value
+
+    [[ -f "$path" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == *=* ]] || continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        if [[ "$key" == "$wanted_key" ]]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done < "$path"
+    return 1
+}
+
+write_backup_schedule_config() {
+    local profile="$1"
+    local expr="$2"
+    local path
+
+    ensure_backup_dirs
+    path="$(backup_schedule_path "$profile")"
+    {
+        printf 'PROFILE_NAME=%s\n' "$profile"
+        printf 'CRON_EXPR=%s\n' "$expr"
+        printf 'DESTINATION=%s\n' "$BACKUP_DESTINATION"
+        printf 'LOCAL_PATH=%s\n' "$BACKUP_LOCAL_PATH"
+        printf 'LOCAL_RETENTION_DAYS=%s\n' "$BACKUP_LOCAL_RETENTION_DAYS"
+        printf 'RCLONE_REMOTE=%s\n' "$BACKUP_RCLONE_REMOTE"
+        printf 'RCLONE_PATH=%s\n' "$BACKUP_RCLONE_PATH"
+    } > "$path"
+    chmod 600 "$path"
+}
+
+load_backup_schedule_config() {
+    local profile="$1"
+    local path
+
+    path="$(backup_schedule_path "$profile")"
+    [[ -f "$path" ]] || {
+        error "Backup schedule config not found: ${path}"
+        return 1
+    }
+
+    BACKUP_DESTINATION="$(backup_config_file_value "$path" "DESTINATION" || true)"
+    BACKUP_LOCAL_PATH="$(backup_config_file_value "$path" "LOCAL_PATH" || true)"
+    BACKUP_LOCAL_RETENTION_DAYS="$(backup_config_file_value "$path" "LOCAL_RETENTION_DAYS" || true)"
+    BACKUP_RCLONE_REMOTE="$(backup_config_file_value "$path" "RCLONE_REMOTE" || true)"
+    BACKUP_RCLONE_PATH="$(backup_config_file_value "$path" "RCLONE_PATH" || true)"
+    BACKUP_CRON_EXPR="$(backup_config_file_value "$path" "CRON_EXPR" || true)"
+
+    case "$BACKUP_DESTINATION" in
+        local|remote|both) ;;
+        *) error "Invalid schedule destination: ${BACKUP_DESTINATION:-missing}"; return 1 ;;
+    esac
+    [[ -n "$BACKUP_LOCAL_RETENTION_DAYS" ]] || BACKUP_LOCAL_RETENTION_DAYS=7
+}
+
 validate_loaded_backup_profile() {
     case "$BACKUP_SOURCE_MODE" in docker|native) ;; *) error "Invalid profile source mode."; return 1 ;; esac
     [[ "$BACKUP_DB_TYPE" == "postgres" ]] && BACKUP_DB_TYPE="postgresql"
     case "$BACKUP_DB_TYPE" in postgresql|mysql|mariadb|mongodb) ;; *) error "Invalid profile database type."; return 1 ;; esac
-    case "$BACKUP_DESTINATION" in local|remote|both) ;; *) error "Invalid profile destination."; return 1 ;; esac
+    if [[ -n "$BACKUP_DESTINATION" ]]; then
+        case "$BACKUP_DESTINATION" in local|remote|both) ;; *) error "Invalid profile destination."; return 1 ;; esac
+    fi
     [[ -n "$BACKUP_LOCAL_RETENTION_DAYS" ]] || BACKUP_LOCAL_RETENTION_DAYS=7
     [[ "$BACKUP_LOCAL_RETENTION_DAYS" =~ ^[0-9]+$ ]] || BACKUP_LOCAL_RETENTION_DAYS=7
 }
@@ -440,6 +515,7 @@ write_backup_run_state() {
     {
         printf 'LAST_RUN=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
         printf 'LAST_RESULT=%s\n' "$BACKUP_LAST_RESULT"
+        printf 'LAST_DESTINATION=%s\n' "$BACKUP_DESTINATION"
         printf 'LAST_LOCAL_FILE=%s\n' "$BACKUP_LAST_LOCAL_FILE"
         printf 'LAST_SIZE=%s\n' "$BACKUP_LAST_SIZE"
         printf 'LAST_REMOTE_RESULT=%s\n' "$BACKUP_LAST_REMOTE_RESULT"
@@ -1868,44 +1944,12 @@ ensure_rclone_available_for_backup() {
         return 0
     fi
 
+    error "rclone is not installed."
     echo
-    echo "rclone is required for remote backups."
-    if ! confirm "Install rclone now?" "yes"; then
-        warning "Remote backup cancelled."
-        return 1
-    fi
-
-    if declare -F install_rclone >/dev/null 2>&1; then
-        install_rclone
-    else
-        apt update
-        apt install -y rclone
-    fi
-}
-
-run_rclone_config_for_backup() {
-    local rc
-
+    echo "Configure rclone first with:"
+    echo "    sudo hostctl --rclone"
     echo
-    echo "hostctl will now open rclone's interactive configuration utility."
-    echo
-    echo "Complete the remote setup, then choose \"q\" inside rclone to return to hostctl."
-    echo
-
-    if ! confirm "Continue?" "yes"; then
-        return 1
-    fi
-
-    set +e
-    rclone config
-    rc=$?
-    set -e
-    if [[ "$rc" -ne 0 ]]; then
-        warning "rclone configuration exited with status ${rc}."
-        return "$rc"
-    fi
-
-    info "Returned from rclone configuration."
+    return 1
 }
 
 load_rclone_remotes() {
@@ -1927,37 +1971,12 @@ select_rclone_remote() {
     done < <(load_rclone_remotes)
 
     if [[ "${#remotes[@]}" -eq 0 ]]; then
-        while true; do
-            if confirm "Configure rclone now?" "yes"; then
-                run_rclone_config_for_backup || return 1
-            else
-                return 1
-            fi
-
-            remotes=()
-            while IFS= read -r remote; do
-                remotes+=("$remote")
-            done < <(load_rclone_remotes)
-            [[ "${#remotes[@]}" -gt 0 ]] && break
-
-            warning "No rclone remote was created."
-            choice="$(
-                select_option \
-                    "rclone remote:" \
-                    "Open rclone config again" \
-                    "Continue with Local backup instead" \
-                    "Cancel"
-            )" || return 1
-            case "$choice" in
-                "Open rclone config again") continue ;;
-                "Continue with Local backup instead")
-                    BACKUP_DESTINATION="local"
-                    printf '\n'
-                    return 1
-                    ;;
-                "Cancel") return 1 ;;
-            esac
-        done
+        error "rclone is not configured."
+        echo
+        echo "Configure rclone first with:"
+        echo "    sudo hostctl --rclone"
+        echo
+        return 1
     fi
 
     echo "Remote destination:" >&2
@@ -1966,24 +1985,19 @@ select_rclone_remote() {
     for i in "${!remotes[@]}"; do
         printf '%d. %s\n' "$((i + 1))" "${remotes[$i]}" >&2
     done
-    printf '%d. Configure a new rclone remote\n' "$(( ${#remotes[@]} + 1 ))" >&2
-    printf '%d. Cancel\n' "$(( ${#remotes[@]} + 2 ))" >&2
+    printf '%d. Cancel\n' "$(( ${#remotes[@]} + 1 ))" >&2
 
     while true; do
         if [[ -r /dev/tty ]]; then
-            read -r -p "Select [1-$(( ${#remotes[@]} + 2 ))]: " choice </dev/tty || return 1
+            read -r -p "Select [1-$(( ${#remotes[@]} + 1 ))]: " choice </dev/tty || return 1
         else
-            read -r -p "Select [1-$(( ${#remotes[@]} + 2 ))]: " choice || return 1
+            read -r -p "Select [1-$(( ${#remotes[@]} + 1 ))]: " choice || return 1
         fi
         if [[ "$choice" =~ ^[0-9]+$ ]]; then
             if (( choice >= 1 && choice <= ${#remotes[@]} )); then
                 printf '%s\n' "${remotes[$((choice - 1))]}"
                 return 0
             elif (( choice == ${#remotes[@]} + 1 )); then
-                run_rclone_config_for_backup || return 1
-                select_rclone_remote
-                return
-            elif (( choice == ${#remotes[@]} + 2 )); then
                 return 1
             fi
         fi
@@ -2031,7 +2045,7 @@ collect_destination_config() {
     fi
 }
 
-collect_backup_config() {
+collect_database_access_config() {
     local source
 
     reset_backup_config
@@ -2046,7 +2060,10 @@ collect_backup_config() {
         "Docker") collect_docker_database_config || return 1 ;;
         "Native / OS") collect_native_database_config || return 1 ;;
     esac
+}
 
+collect_backup_config() {
+    collect_database_access_config || return 1
     collect_destination_config
 }
 
@@ -2596,9 +2613,6 @@ save_profile_interactive() {
         write_backup_profile "$profile" || return 1
         success "Backup profile created: ${profile}"
         log_event "BACKUP_PROFILE_SAVE profile=${profile} result=success"
-        if confirm "Schedule this backup profile now?" "no"; then
-            schedule_backup_profile "$profile"
-        fi
         return 0
     done
 }
@@ -2622,11 +2636,13 @@ inspect_backup_profile() {
         printf 'Port: %s\n' "$BACKUP_DB_PORT"
         printf 'Credential source: %s\n' "$BACKUP_CREDENTIAL_SOURCE"
     fi
-    printf 'Destination: %s\n' "$BACKUP_DESTINATION"
-    printf 'Local path: %s\n' "$BACKUP_LOCAL_PATH"
-    printf 'Retention: %s days\n' "$BACKUP_LOCAL_RETENTION_DAYS"
-    if [[ -n "$BACKUP_RCLONE_REMOTE" ]]; then
-        printf 'Remote: %s%s\n' "$BACKUP_RCLONE_REMOTE" "$BACKUP_RCLONE_PATH"
+    echo
+    echo "Schedule:"
+    if [[ -f "$(backup_schedule_path "$profile")" ]]; then
+        printf 'Destination: %s\n' "$(backup_config_file_value "$(backup_schedule_path "$profile")" "DESTINATION" || printf 'unknown')"
+        printf 'Cron: %s\n' "$(backup_config_file_value "$(backup_schedule_path "$profile")" "CRON_EXPR" || printf 'unknown')"
+    else
+        printf 'Not scheduled\n'
     fi
 }
 
@@ -2735,11 +2751,14 @@ schedule_expression_interactive() {
 remove_backup_schedule() {
     local profile="$1"
     local temp
+    local schedule_path
 
     temp="$(mktemp)"
     crontab -l 2>/dev/null | grep -Fv "# HOSTCTL:backup:${profile}" > "$temp" || true
     crontab "$temp"
     rm -f "$temp"
+    schedule_path="$(backup_schedule_path "$profile")"
+    [[ -f "$schedule_path" ]] && rm -f "$schedule_path"
     log_event "BACKUP_SCHEDULE_REMOVE profile=${profile} result=success"
     success "Backup schedule removed: ${profile}"
 }
@@ -2758,6 +2777,8 @@ schedule_backup_profile() {
         CANCEL) warning "Backup schedule cancelled."; return 0 ;;
     esac
 
+    collect_destination_config || return 1
+
     echo
     printf 'Profile: %s\n' "$profile"
     printf 'Schedule: %s\n' "$expr"
@@ -2769,7 +2790,10 @@ schedule_backup_profile() {
         return 0
     fi
 
-    command="/usr/local/bin/hostctl --backup-now --profile ${profile} --cron >> ${HOSTCTL_LOG_DIR}/backup-${profile}.log 2>&1 # HOSTCTL:backup:${profile}"
+    write_backup_schedule_config "$profile" "$expr"
+    backup_file "$(backup_profile_path "$profile")" >/dev/null 2>&1 || true
+    write_backup_profile "$profile"
+    command="/usr/local/bin/hostctl --backup-now --profile ${profile} --schedule-config ${profile} --cron >> ${HOSTCTL_LOG_DIR}/backup-${profile}.log 2>&1 # HOSTCTL:backup:${profile}"
     temp="$(mktemp)"
     crontab -l 2>/dev/null | grep -Fv "# HOSTCTL:backup:${profile}" > "$temp" || true
     printf '%s %s\n' "$expr" "$command" >> "$temp"
@@ -2784,6 +2808,7 @@ run_profile_now() {
     local status=0
 
     load_backup_profile "$profile" || return 1
+    collect_destination_config || return 1
     with_backup_lock "$profile" run_database_backup "$profile" || status=$?
     if [[ "$BACKUP_CRON_MODE" -eq 1 ]]; then
         return "$status"
@@ -2802,7 +2827,9 @@ show_backup_status_for_profile() {
     local latest=""
     local size=""
     local remote=""
+    local last_destination=""
     local schedule="not scheduled"
+    local schedule_destination=""
 
     load_backup_profile "$profile" || return 0
     state_file="$(backup_run_state_path "$profile")"
@@ -2813,6 +2840,7 @@ show_backup_status_for_profile() {
             case "$key" in
                 LAST_RUN) last_run="$value" ;;
                 LAST_RESULT) result="$value" ;;
+                LAST_DESTINATION) last_destination="$value" ;;
                 LAST_LOCAL_FILE) latest="$value" ;;
                 LAST_SIZE) size="$value" ;;
                 LAST_REMOTE_RESULT) remote="$value" ;;
@@ -2823,16 +2851,17 @@ show_backup_status_for_profile() {
     if crontab -l 2>/dev/null | grep -F "# HOSTCTL:backup:${profile}" >/dev/null; then
         schedule="$(crontab -l 2>/dev/null | awk -v marker="# HOSTCTL:backup:${profile}" 'index($0, marker) { print $1, $2, $3, $4, $5; exit }')"
     fi
+    if [[ -f "$(backup_schedule_path "$profile")" ]]; then
+        schedule_destination="$(backup_config_file_value "$(backup_schedule_path "$profile")" "DESTINATION" || true)"
+        [[ -n "$schedule_destination" ]] && schedule="${schedule} (${schedule_destination})"
+    fi
 
     printf '   Source: %s / %s\n' "$BACKUP_SOURCE_MODE" "$BACKUP_DB_TYPE"
     printf '   Database: %s\n' "$BACKUP_DB_NAME"
-    printf '   Destination: %s\n' "$BACKUP_DESTINATION"
-    printf '   Local path: %s\n' "$BACKUP_LOCAL_PATH"
-    [[ -n "$BACKUP_RCLONE_REMOTE" ]] && printf '   Remote: %s%s\n' "$BACKUP_RCLONE_REMOTE" "$BACKUP_RCLONE_PATH"
-    printf '   Retention: %s days\n' "$BACKUP_LOCAL_RETENTION_DAYS"
     echo
     printf '   Schedule: %s\n' "$schedule"
     printf '   Last run: %s\n' "${last_run:-never}"
+    printf '   Destination used: %s\n' "${last_destination:-unknown}"
     printf '   Result: %s\n' "${result:-unknown}"
     printf '   Latest backup: %s\n' "${latest:-none}"
     printf '   Size: %s\n' "${size:-unknown}"
@@ -2903,25 +2932,10 @@ cmd_db_backup() {
 
     case "$action" in
         "Create profile")
-            collect_backup_config || return 0
-            if confirm "Test database connection now?" "yes"; then
-                if ! test_database_connection; then
-                    warning "Database connection test failed."
-                    local failed_action
-                    failed_action="$(
-                        select_option \
-                            "Connection test:" \
-                            "Fix configuration" \
-                            "Save profile anyway" \
-                            "Cancel"
-                    )" || return 1
-                    case "$failed_action" in
-                        "Fix configuration") collect_backup_config || return 0 ;;
-                        "Cancel") warning "Profile creation cancelled."; return 0 ;;
-                    esac
-                fi
+            collect_database_access_config || return 0
+            if save_profile_interactive && confirm "Schedule this profile now?" "no"; then
+                schedule_backup_profile "$BACKUP_PROFILE_NAME"
             fi
-            save_profile_interactive
             ;;
         "List profiles")
             list_backup_profiles
@@ -2933,7 +2947,7 @@ cmd_db_backup() {
         "Edit profile")
             profile="$(select_backup_profile)" || return 0
             backup_file "$(backup_profile_path "$profile")" >/dev/null 2>&1 || true
-            collect_backup_config || return 0
+            collect_database_access_config || return 0
             BACKUP_PROFILE_NAME="$profile"
             write_backup_profile "$profile"
             success "Backup profile updated: ${profile}"
@@ -2982,6 +2996,18 @@ parse_backup_now_args() {
             --cron)
                 BACKUP_CRON_MODE=1
                 ;;
+            --schedule-config)
+                shift
+                if [[ $# -eq 0 || "${1:-}" == --* ]]; then
+                    error "--schedule-config requires a schedule name."
+                    return 1
+                fi
+                valid_profile_name "$1" || {
+                    error "Invalid schedule config name: $1"
+                    return 1
+                }
+                BACKUP_SCHEDULE_CONFIG_NAME="$1"
+                ;;
             *)
                 error "Unknown backup option: ${arg}"
                 return 1
@@ -3008,6 +3034,18 @@ cmd_backup_now() {
 
     if [[ -n "$BACKUP_PROFILE_NAME" ]]; then
         load_backup_profile "$BACKUP_PROFILE_NAME" || return 1
+        if [[ "$BACKUP_CRON_MODE" -eq 1 ]]; then
+            if [[ -n "$BACKUP_SCHEDULE_CONFIG_NAME" ]]; then
+                load_backup_schedule_config "$BACKUP_SCHEDULE_CONFIG_NAME" || return 1
+            elif [[ -z "$BACKUP_DESTINATION" ]]; then
+                error "Cron backup requires --schedule-config for destination settings."
+                return 1
+            else
+                warning "Using legacy destination fields from DB profile."
+            fi
+        else
+            collect_destination_config || return 1
+        fi
         with_backup_lock "$BACKUP_PROFILE_NAME" run_database_backup "$BACKUP_PROFILE_NAME" || save_status=$?
         if [[ "$BACKUP_CRON_MODE" -eq 1 ]]; then
             return "$save_status"
@@ -3025,7 +3063,13 @@ cmd_backup_now() {
 
     if [[ "$save_status" -eq 0 ]]; then
         if confirm "Save this configuration as a backup profile?" "no"; then
-            save_profile_interactive || warning "PROFILE SAVE FAILED"
+            if save_profile_interactive; then
+                if confirm "Schedule this profile now?" "no"; then
+                    schedule_backup_profile "$BACKUP_PROFILE_NAME"
+                fi
+            else
+                warning "PROFILE SAVE FAILED"
+            fi
         fi
     fi
 
@@ -3065,7 +3109,8 @@ select_local_restore_file() {
         fi
         if [[ "$choice" =~ ^[0-9]+$ ]]; then
             if (( choice >= 1 && choice <= ${#profiles[@]} )); then
-                path="$(backup_profile_value "${profiles[$((choice - 1))]}" "LOCAL_PATH")" || return 1
+                path="$(backup_profile_value "${profiles[$((choice - 1))]}" "LOCAL_PATH" || true)"
+                [[ -n "$path" ]] || path="${BACKUP_DATABASE_DIR}/$(sanitize_backup_name "${profiles[$((choice - 1))]}")"
                 select_backup_file_from_dir "$path"
                 return
             elif (( choice == ${#profiles[@]} + 1 )); then
@@ -3124,8 +3169,118 @@ validate_restore_file() {
     esac
 }
 
+restore_interrupted() {
+    warning "Restore interrupted."
+    if [[ -n "${BACKUP_RESTORE_SAFETY_FILE:-}" ]]; then
+        info "Safety backup preserved at: ${BACKUP_RESTORE_SAFETY_FILE}"
+    fi
+    return 130
+}
+
+sql_stream_restore() {
+    local file="$1"
+    shift
+
+    if [[ "$file" == *.gz ]]; then
+        gzip -dc "$file" | "$@"
+    else
+        "$@" < "$file"
+    fi
+}
+
+docker_postgres_exec() {
+    local password
+    password="$(backup_password_env_prefix)"
+    if [[ -n "$password" ]]; then
+        docker_target_exec env "PGPASSWORD=${password}" psql -v ON_ERROR_STOP=1 -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
+    else
+        docker_target_exec psql -v ON_ERROR_STOP=1 -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
+    fi
+}
+
+native_postgres_exec() {
+    local password
+    password="$(backup_password_env_prefix)"
+    if [[ -n "$password" ]]; then
+        env "PGPASSWORD=${password}" psql -v ON_ERROR_STOP=1 -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
+    else
+        psql -v ON_ERROR_STOP=1 -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
+    fi
+}
+
+docker_mysql_exec() {
+    local password
+    password="$(backup_password_env_prefix)"
+    if [[ -n "$password" ]]; then
+        docker_target_exec env "MYSQL_PWD=${password}" "$(docker_mysql_client_command_name)" -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$@"
+    else
+        docker_mysql_client_exec -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$@"
+    fi
+}
+
+docker_mysql_exec_input() {
+    local password
+    password="$(backup_password_env_prefix)"
+    if [[ -n "$password" ]]; then
+        docker_target_exec_input env "MYSQL_PWD=${password}" "$(docker_mysql_client_command_name)" -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$@"
+    else
+        docker_mysql_client_exec_input -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$@"
+    fi
+}
+
+native_mysql_command_name() {
+    if command_exists mariadb; then
+        printf 'mariadb\n'
+    else
+        printf 'mysql\n'
+    fi
+}
+
+native_mysql_exec() {
+    local password
+    local mysql_cmd
+    password="$(backup_password_env_prefix)"
+    mysql_cmd="$(native_mysql_command_name)"
+    if [[ -n "$password" ]]; then
+        env "MYSQL_PWD=${password}" "$mysql_cmd" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$@"
+    else
+        "$mysql_cmd" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$@"
+    fi
+}
+
+mysql_quote_identifier() {
+    local value="$1"
+    value="${value//\`/\`\`}"
+    printf '`%s`' "$value"
+}
+
+clean_restore_target() {
+    local db_ident
+
+    info "Preparing clean restore target..."
+    case "$BACKUP_DB_TYPE" in
+        postgresql|postgres)
+            if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
+                docker_postgres_exec -c 'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO public;' || return 1
+            else
+                native_postgres_exec -c 'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO public;' || return 1
+            fi
+            ;;
+        mysql|mariadb)
+            db_ident="$(mysql_quote_identifier "$BACKUP_DB_NAME")"
+            if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
+                docker_mysql_exec -e "DROP DATABASE IF EXISTS ${db_ident}; CREATE DATABASE ${db_ident};" || return 1
+            else
+                native_mysql_exec -e "DROP DATABASE IF EXISTS ${db_ident}; CREATE DATABASE ${db_ident};" || return 1
+            fi
+            ;;
+        mongodb)
+            return 0
+            ;;
+    esac
+}
+
 download_remote_restore_file() {
-    local profile
     local files=()
     local file
     local choice
@@ -3134,10 +3289,9 @@ download_remote_restore_file() {
     local remote_path
     local local_file
 
-    profile="$(select_backup_profile)" || return 1
-    remote="$(backup_profile_value "$profile" "RCLONE_REMOTE")" || return 1
-    remote_path="$(backup_profile_value "$profile" "RCLONE_PATH")" || return 1
     ensure_rclone_available_for_backup || return 1
+    remote="$(select_rclone_remote)" || return 1
+    remote_path="$(ask_input "Remote backup path" "hostctl/backups")" || return 1
     remote_base="${remote}${remote_path}"
 
     while IFS= read -r file; do
@@ -3176,37 +3330,25 @@ restore_database_from_file() {
 
     backup_resolve_runtime_values || return 1
     password="$(backup_password_env_prefix)"
+    clean_restore_target || {
+        error "Failed to prepare clean restore target."
+        return 1
+    }
 
     if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
         case "$BACKUP_DB_TYPE" in
             postgresql|postgres)
-                if [[ "$file" == *.gz ]]; then
-                    if [[ -n "$password" ]]; then
-                        gzip -dc "$file" | docker_target_exec_input env "PGPASSWORD=${password}" psql -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
-                    else
-                        gzip -dc "$file" | docker_target_exec_input psql -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
-                    fi
+                if [[ -n "$password" ]]; then
+                    sql_stream_restore "$file" docker_target_exec_input env "PGPASSWORD=${password}" psql -v ON_ERROR_STOP=1 -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
                 else
-                    if [[ -n "$password" ]]; then
-                        docker_target_exec_input env "PGPASSWORD=${password}" psql -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" < "$file"
-                    else
-                        docker_target_exec_input psql -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" < "$file"
-                    fi
+                    sql_stream_restore "$file" docker_target_exec_input psql -v ON_ERROR_STOP=1 -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
                 fi
                 ;;
             mysql|mariadb)
-                if [[ "$file" == *.gz ]]; then
-                    if [[ -n "$password" ]]; then
-                        gzip -dc "$file" | docker_target_exec_input env "MYSQL_PWD=${password}" "$(docker_mysql_client_command_name)" -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
-                    else
-                        gzip -dc "$file" | docker_mysql_client_exec_input -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
-                    fi
+                if [[ -n "$password" ]]; then
+                    sql_stream_restore "$file" docker_target_exec_input env "MYSQL_PWD=${password}" "$(docker_mysql_client_command_name)" -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
                 else
-                    if [[ -n "$password" ]]; then
-                        docker_target_exec_input env "MYSQL_PWD=${password}" "$(docker_mysql_client_command_name)" -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
-                    else
-                        docker_mysql_client_exec_input -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
-                    fi
+                    sql_stream_restore "$file" docker_mysql_client_exec_input -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
                 fi
                 ;;
             mongodb)
@@ -3215,47 +3357,29 @@ restore_database_from_file() {
                     error "mongorestore not found in selected Docker target."
                     return 1
                 }
-                docker_target_exec_input mongorestore --uri="$(mongo_connection_uri)" --archive --gzip < "$file"
+                docker_target_exec_input mongorestore --uri="$(mongo_connection_uri)" --archive --gzip --drop < "$file"
                 ;;
         esac
     else
         case "$BACKUP_DB_TYPE" in
             postgresql|postgres)
-                if [[ "$file" == *.gz ]]; then
-                    if [[ -n "$password" ]]; then
-                        gzip -dc "$file" | PGPASSWORD="$password" psql -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
-                    else
-                        gzip -dc "$file" | psql -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
-                    fi
+                if [[ -n "$password" ]]; then
+                    sql_stream_restore "$file" env "PGPASSWORD=${password}" psql -v ON_ERROR_STOP=1 -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
                 else
-                    if [[ -n "$password" ]]; then
-                        PGPASSWORD="$password" psql -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
-                    else
-                        psql -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
-                    fi
+                    sql_stream_restore "$file" psql -v ON_ERROR_STOP=1 -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
                 fi
                 ;;
             mysql|mariadb)
-                local mysql_cmd="mysql"
-                command_exists mariadb && mysql_cmd="mariadb"
-                if [[ "$file" == *.gz ]]; then
-                    if [[ -n "$password" ]]; then
-                        gzip -dc "$file" | MYSQL_PWD="$password" "$mysql_cmd" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
-                    else
-                        gzip -dc "$file" | "$mysql_cmd" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
-                    fi
+                if [[ -n "$password" ]]; then
+                    sql_stream_restore "$file" env "MYSQL_PWD=${password}" "$(native_mysql_command_name)" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
                 else
-                    if [[ -n "$password" ]]; then
-                        MYSQL_PWD="$password" "$mysql_cmd" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
-                    else
-                        "$mysql_cmd" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
-                    fi
+                    sql_stream_restore "$file" "$(native_mysql_command_name)" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
                 fi
                 ;;
             mongodb)
                 [[ "$file" == *.archive.gz ]] || { error "MongoDB restore requires a .archive.gz backup."; return 1; }
                 command_exists mongorestore || { error "mongorestore not found."; return 1; }
-                mongorestore --uri="$(mongo_connection_uri)" --archive="$file" --gzip
+                mongorestore --uri="$(mongo_connection_uri)" --archive="$file" --gzip --drop
                 ;;
         esac
     fi
@@ -3306,19 +3430,18 @@ cmd_db_restore() {
     printf 'Backup: %s\n' "$(basename "$file")"
     echo
 
-    if confirm "Create safety backup before restore?" "yes"; then
-        local original_destination="$BACKUP_DESTINATION"
-        BACKUP_DESTINATION="local"
-        BACKUP_LOCAL_PATH="${BACKUP_DATABASE_DIR}/pre-restore"
-        if ! with_backup_lock "pre-restore-$(sanitize_backup_name "$BACKUP_DB_NAME")" run_database_backup "pre-restore-$(sanitize_backup_name "$BACKUP_DB_NAME")" "pre_restore"; then
-            error "Safety backup failed."
-            if ! confirm "Continue without safety backup?" "no"; then
-                BACKUP_DESTINATION="$original_destination"
-                return 1
-            fi
-        fi
+    info "Creating mandatory safety backup before restore..."
+    local original_destination="$BACKUP_DESTINATION"
+    BACKUP_DESTINATION="local"
+    BACKUP_LOCAL_PATH="${BACKUP_DATABASE_DIR}/pre-restore"
+    if ! with_backup_lock "pre-restore-$(sanitize_backup_name "$BACKUP_DB_NAME")" run_database_backup "pre-restore-$(sanitize_backup_name "$BACKUP_DB_NAME")" "pre_restore"; then
         BACKUP_DESTINATION="$original_destination"
+        error "Safety backup failed. Restore cancelled."
+        return 1
     fi
+    BACKUP_RESTORE_SAFETY_FILE="$BACKUP_LAST_LOCAL_FILE"
+    BACKUP_DESTINATION="$original_destination"
+    info "Safety backup preserved at: ${BACKUP_RESTORE_SAFETY_FILE}"
 
     confirm_name="$(ask_input "Type database name to confirm restore")" || return 1
     if [[ "$confirm_name" != "$BACKUP_DB_NAME" ]]; then
@@ -3326,9 +3449,25 @@ cmd_db_restore() {
         return 0
     fi
 
+    trap 'restore_interrupted; exit 130' INT
     restore_database_from_file "$file" || {
+        trap - INT
         log_event "RESTORE_FAILED database=${BACKUP_DB_NAME}"
         error "RESTORE FAILED"
+        if [[ -n "${BACKUP_RESTORE_SAFETY_FILE:-}" ]]; then
+            info "Safety backup preserved at: ${BACKUP_RESTORE_SAFETY_FILE}"
+        fi
+        return 1
+    }
+    trap - INT
+
+    BACKUP_PREFLIGHT_DONE=0
+    preflight_database_config || {
+        log_event "RESTORE_VALIDATE_FAILED database=${BACKUP_DB_NAME}"
+        error "RESTORE VALIDATION FAILED"
+        if [[ -n "${BACKUP_RESTORE_SAFETY_FILE:-}" ]]; then
+            info "Safety backup preserved at: ${BACKUP_RESTORE_SAFETY_FILE}"
+        fi
         return 1
     }
 

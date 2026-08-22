@@ -17,6 +17,7 @@ NGINX_LIB="${SCRIPT_DIR}/lib/nginx.sh"
 SSL_LIB="${SCRIPT_DIR}/lib/ssl.sh"
 FIREWALL_LIB="${SCRIPT_DIR}/lib/firewall.sh"
 BACKUP_LIB="${SCRIPT_DIR}/lib/backup.sh"
+RCLONE_LIB="${SCRIPT_DIR}/lib/rclone.sh"
 
 # ---------------------------------------------------------
 # Load required libraries
@@ -78,6 +79,13 @@ fi
 
 # shellcheck source=lib/backup.sh
 source "$BACKUP_LIB"
+
+if [[ ! -f "$RCLONE_LIB" ]]; then
+    die "Missing required library: $RCLONE_LIB"
+fi
+
+# shellcheck source=lib/rclone.sh
+source "$RCLONE_LIB"
 
 # ---------------------------------------------------------
 # Help
@@ -441,7 +449,7 @@ case "$COMMAND" in
 
     # rclone
     --rclone)
-        die "--rclone is not implemented yet."
+        cmd_rclone "$@"
         ;;
 
     # Cron
