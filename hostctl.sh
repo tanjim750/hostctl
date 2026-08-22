@@ -156,6 +156,7 @@ Firewall:
 Database / Backup:
   --db-backup              Backup project database
   --db-restore             Restore project database
+  --db-diagnose            Run read-only database diagnostics
   --backup-now             Run backup now
   --backup-schedule        Configure backup cron
   --backup-status          Show backup status
@@ -433,6 +434,10 @@ case "$COMMAND" in
 
     --db-restore)
         cmd_db_restore "$@"
+        ;;
+
+    --db-diagnose)
+        cmd_db_diagnose "$@"
         ;;
 
     --backup-now)
