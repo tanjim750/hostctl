@@ -310,7 +310,7 @@ backup_disk_space_check() {
 
 profile_key_allowed() {
     case "$1" in
-        PROFILE_NAME|SOURCE_MODE|DB_TYPE|PROJECT_DIR|COMPOSE_FILE|ENV_FILE|DB_SERVICE|DOCKER_TARGET_TYPE|DOCKER_CONTAINER|DOCKER_IMAGE|DB_HOST|DB_PORT|DB_NAME|DB_USER|DB_NAME_VAR|DB_USER_VAR|DB_PASSWORD_VAR|DB_HOST_VAR|DB_PORT_VAR|MONGO_URI_VAR|CREDENTIAL_SOURCE|DESTINATION|LOCAL_PATH|LOCAL_RETENTION_DAYS|RCLONE_REMOTE|RCLONE_PATH)
+        PROFILE_NAME|SOURCE_MODE|DB_TYPE|PROJECT_DIR|COMPOSE_FILE|ENV_FILE|DB_SERVICE|DOCKER_TARGET_TYPE|DOCKER_CONTAINER|DOCKER_IMAGE|DB_HOST|DB_PORT|DB_NAME|DB_USER|DB_NAME_VAR|DB_USER_VAR|DB_PASSWORD_VAR|DB_HOST_VAR|DB_PORT_VAR|MONGO_URI_VAR|CREDENTIAL_SOURCE)
             return 0
             ;;
         *)
@@ -345,11 +345,6 @@ set_backup_config_value() {
         DB_PORT_VAR) BACKUP_DB_PORT_VAR="$value" ;;
         MONGO_URI_VAR) BACKUP_MONGO_URI_VAR="$value" ;;
         CREDENTIAL_SOURCE) BACKUP_CREDENTIAL_SOURCE="$value" ;;
-        DESTINATION) BACKUP_DESTINATION="$value" ;;
-        LOCAL_PATH) BACKUP_LOCAL_PATH="$value" ;;
-        LOCAL_RETENTION_DAYS) BACKUP_LOCAL_RETENTION_DAYS="$value" ;;
-        RCLONE_REMOTE) BACKUP_RCLONE_REMOTE="$value" ;;
-        RCLONE_PATH) BACKUP_RCLONE_PATH="$value" ;;
     esac
 }
 
@@ -401,6 +396,7 @@ load_backup_profile() {
     }
     path="$(backup_profile_path "$profile")"
     [[ -f "$path" ]] || {
+        HOSTCTL_ERROR_HANDLED=1
         error "Backup profile not found: ${profile}"
         return 1
     }
@@ -464,9 +460,22 @@ write_backup_schedule_config() {
     local profile="$1"
     local expr="$2"
     local path
+    local temp
 
     ensure_backup_dirs
+    mkdir -p "$BACKUP_SCHEDULE_STATE_DIR" || {
+        HOSTCTL_ERROR_HANDLED=1
+        error "Failed to create backup schedule directory: ${BACKUP_SCHEDULE_STATE_DIR}"
+        return 1
+    }
+    chmod 700 "$BACKUP_SCHEDULE_STATE_DIR" 2>/dev/null || true
+
     path="$(backup_schedule_path "$profile")"
+    temp="$(mktemp "${path}.tmp.XXXXXX")" || {
+        HOSTCTL_ERROR_HANDLED=1
+        error "Failed to create temporary schedule config."
+        return 1
+    }
     {
         printf 'PROFILE_NAME=%s\n' "$profile"
         printf 'CRON_EXPR=%s\n' "$expr"
@@ -475,8 +484,25 @@ write_backup_schedule_config() {
         printf 'LOCAL_RETENTION_DAYS=%s\n' "$BACKUP_LOCAL_RETENTION_DAYS"
         printf 'RCLONE_REMOTE=%s\n' "$BACKUP_RCLONE_REMOTE"
         printf 'RCLONE_PATH=%s\n' "$BACKUP_RCLONE_PATH"
-    } > "$path"
-    chmod 600 "$path"
+    } > "$temp" || {
+        rm -f "$temp"
+        HOSTCTL_ERROR_HANDLED=1
+        error "Failed to write schedule config: ${path}"
+        return 1
+    }
+    chmod 600 "$temp"
+    mv "$temp" "$path" || {
+        rm -f "$temp"
+        HOSTCTL_ERROR_HANDLED=1
+        error "Failed to install schedule config: ${path}"
+        return 1
+    }
+    [[ -r "$path" ]] || {
+        HOSTCTL_ERROR_HANDLED=1
+        error "Schedule config is not readable: ${path}"
+        return 1
+    }
+    load_backup_schedule_config "$profile" >/dev/null || return 1
 }
 
 load_backup_schedule_config() {
@@ -485,9 +511,18 @@ load_backup_schedule_config() {
 
     path="$(backup_schedule_path "$profile")"
     [[ -f "$path" ]] || {
-        error "Backup schedule config not found: ${path}"
+        HOSTCTL_ERROR_HANDLED=1
+        error "Schedule config not found:"
+        error "$path"
         return 1
     }
+
+    BACKUP_DESTINATION=""
+    BACKUP_LOCAL_PATH=""
+    BACKUP_LOCAL_RETENTION_DAYS=""
+    BACKUP_RCLONE_REMOTE=""
+    BACKUP_RCLONE_PATH=""
+    BACKUP_CRON_EXPR=""
 
     BACKUP_DESTINATION="$(backup_config_file_value "$path" "DESTINATION" || true)"
     BACKUP_LOCAL_PATH="$(backup_config_file_value "$path" "LOCAL_PATH" || true)"
@@ -498,18 +533,38 @@ load_backup_schedule_config() {
 
     case "$BACKUP_DESTINATION" in
         local|remote|both) ;;
-        *) error "Invalid schedule destination: ${BACKUP_DESTINATION:-missing}"; return 1 ;;
+        *)
+            HOSTCTL_ERROR_HANDLED=1
+            error "Invalid schedule destination: ${BACKUP_DESTINATION:-missing}"
+            return 1
+            ;;
     esac
     [[ -n "$BACKUP_LOCAL_RETENTION_DAYS" ]] || BACKUP_LOCAL_RETENTION_DAYS=7
+    [[ "$BACKUP_LOCAL_RETENTION_DAYS" =~ ^[0-9]+$ ]] || {
+        HOSTCTL_ERROR_HANDLED=1
+        error "Invalid schedule retention days: ${BACKUP_LOCAL_RETENTION_DAYS}"
+        return 1
+    }
+    if [[ "$BACKUP_DESTINATION" == "local" || "$BACKUP_DESTINATION" == "both" ]]; then
+        [[ -n "$BACKUP_LOCAL_PATH" ]] || {
+            HOSTCTL_ERROR_HANDLED=1
+            error "Schedule local path is missing."
+            return 1
+        }
+    fi
+    if [[ "$BACKUP_DESTINATION" == "remote" || "$BACKUP_DESTINATION" == "both" ]]; then
+        [[ -n "$BACKUP_RCLONE_REMOTE" && -n "$BACKUP_RCLONE_PATH" ]] || {
+            HOSTCTL_ERROR_HANDLED=1
+            error "Schedule remote destination is incomplete."
+            return 1
+        }
+    fi
 }
 
 validate_loaded_backup_profile() {
     case "$BACKUP_SOURCE_MODE" in docker|native) ;; *) error "Invalid profile source mode."; return 1 ;; esac
     [[ "$BACKUP_DB_TYPE" == "postgres" ]] && BACKUP_DB_TYPE="postgresql"
     case "$BACKUP_DB_TYPE" in postgresql|mysql|mariadb|mongodb) ;; *) error "Invalid profile database type."; return 1 ;; esac
-    if [[ -n "$BACKUP_DESTINATION" ]]; then
-        case "$BACKUP_DESTINATION" in local|remote|both) ;; *) error "Invalid profile destination."; return 1 ;; esac
-    fi
     [[ -n "$BACKUP_LOCAL_RETENTION_DAYS" ]] || BACKUP_LOCAL_RETENTION_DAYS=7
     [[ "$BACKUP_LOCAL_RETENTION_DAYS" =~ ^[0-9]+$ ]] || BACKUP_LOCAL_RETENTION_DAYS=7
 }
@@ -2017,6 +2072,12 @@ collect_destination_config() {
     local choice
     local default_profile
 
+    BACKUP_DESTINATION=""
+    BACKUP_LOCAL_PATH=""
+    BACKUP_LOCAL_RETENTION_DAYS=""
+    BACKUP_RCLONE_REMOTE=""
+    BACKUP_RCLONE_PATH=""
+
     choice="$(
         select_option \
             "Backup destination:" \
@@ -2488,6 +2549,55 @@ rclone_remote_target() {
     printf '%s%s\n' "$BACKUP_RCLONE_REMOTE" "$BACKUP_RCLONE_PATH"
 }
 
+verify_backup_remote_destination() {
+    local remote="$BACKUP_RCLONE_REMOTE"
+    local configured_remote
+    local found=0
+
+    ensure_rclone_available_for_backup || {
+        HOSTCTL_ERROR_HANDLED=1
+        return 1
+    }
+    [[ -n "$remote" ]] || {
+        HOSTCTL_ERROR_HANDLED=1
+        error "rclone remote is not configured."
+        return 1
+    }
+    [[ "$remote" == *: ]] || remote="${remote}:"
+
+    while IFS= read -r configured_remote; do
+        if [[ "$configured_remote" == "$remote" ]]; then
+            found=1
+            break
+        fi
+    done < <(rclone listremotes 2>/dev/null || true)
+
+    if [[ "$found" -ne 1 ]]; then
+        HOSTCTL_ERROR_HANDLED=1
+        error "rclone remote not found: ${remote}"
+        return 1
+    fi
+
+    BACKUP_RCLONE_REMOTE="$remote"
+}
+
+validate_backup_destination_before_dump() {
+    local output_dir="$1"
+
+    mkdir -p "$output_dir" || {
+        HOSTCTL_ERROR_HANDLED=1
+        error "Failed to create local backup directory: ${output_dir}"
+        return 1
+    }
+    chmod 700 "$output_dir" 2>/dev/null || true
+
+    case "$BACKUP_DESTINATION" in
+        remote|both)
+            verify_backup_remote_destination || return 1
+            ;;
+    esac
+}
+
 upload_backup_remote() {
     local file="$1"
 
@@ -2544,8 +2654,7 @@ run_database_backup() {
 
     output_dir="$BACKUP_LOCAL_PATH"
     [[ -n "$output_dir" ]] || output_dir="${BACKUP_DATABASE_DIR}/$(sanitize_backup_name "$profile")"
-    mkdir -p "$output_dir"
-    chmod 700 "$output_dir" 2>/dev/null || true
+    validate_backup_destination_before_dump "$output_dir" || return 1
     backup_disk_space_check "$output_dir" || return 1
 
     output_file="${output_dir}/$(backup_filename "$prefix")"
@@ -2906,17 +3015,21 @@ schedule_backup_profile() {
         return 0
     fi
 
-    write_backup_schedule_config "$profile" "$expr"
-    backup_file "$(backup_profile_path "$profile")" >/dev/null 2>&1 || true
-    write_backup_profile "$profile"
+    write_backup_schedule_config "$profile" "$expr" || return 1
     command="/usr/local/bin/hostctl --backup-now --profile ${profile} --schedule-config ${profile} --cron >> ${HOSTCTL_LOG_DIR}/backup-${profile}.log 2>&1 # HOSTCTL:backup:${profile}"
     temp="$(mktemp)"
     crontab -l 2>/dev/null | grep -Fv "# HOSTCTL:backup:${profile}" > "$temp" || true
     printf '%s %s\n' "$expr" "$command" >> "$temp"
-    crontab "$temp"
+    crontab "$temp" || {
+        rm -f "$temp"
+        HOSTCTL_ERROR_HANDLED=1
+        error "Failed to install backup cron entry."
+        return 1
+    }
     rm -f "$temp"
+    load_backup_schedule_config "$profile" >/dev/null || return 1
     log_event "BACKUP_SCHEDULE profile=${profile} expression=${expr} result=success"
-    success "Backup schedule configured: ${profile}"
+    success "Backup schedule configured"
 }
 
 run_profile_now() {
@@ -3093,55 +3206,63 @@ test_database_connection() {
 }
 
 parse_backup_now_args() {
-    local arg
-
     while [[ $# -gt 0 ]]; do
-        arg="$1"
-        case "$arg" in
+        case "$1" in
             --profile)
-                shift
-                if [[ $# -eq 0 || "${1:-}" == --* ]]; then
+                if [[ $# -lt 2 || "${2:-}" == --* ]]; then
+                    HOSTCTL_ERROR_HANDLED=1
                     error "--profile requires a profile name."
                     return 1
                 fi
-                valid_profile_name "$1" || {
-                    error "Invalid backup profile name: $1"
+                valid_profile_name "$2" || {
+                    HOSTCTL_ERROR_HANDLED=1
+                    error "Invalid backup profile name: $2"
                     return 1
                 }
-                BACKUP_PROFILE_NAME="${1:-}"
+                BACKUP_PROFILE_NAME="$2"
+                shift 2
                 ;;
             --cron)
                 BACKUP_CRON_MODE=1
+                shift
                 ;;
             --schedule-config)
-                shift
-                if [[ $# -eq 0 || "${1:-}" == --* ]]; then
+                if [[ $# -lt 2 || "${2:-}" == --* ]]; then
+                    HOSTCTL_ERROR_HANDLED=1
                     error "--schedule-config requires a schedule name."
                     return 1
                 fi
-                valid_profile_name "$1" || {
-                    error "Invalid schedule config name: $1"
+                valid_profile_name "$2" || {
+                    HOSTCTL_ERROR_HANDLED=1
+                    error "Invalid schedule config name: $2"
                     return 1
                 }
-                BACKUP_SCHEDULE_CONFIG_NAME="$1"
+                BACKUP_SCHEDULE_CONFIG_NAME="$2"
+                shift 2
                 ;;
             *)
-                error "Unknown backup option: ${arg}"
+                HOSTCTL_ERROR_HANDLED=1
+                error "Unknown backup option: $1"
                 return 1
                 ;;
         esac
-        shift || true
     done
 }
 
 cmd_backup_now() {
     local save_status=0
+    local requested_profile=""
+    local requested_schedule=""
+    local cron_mode=0
 
     require_root
     require_debian_based
     ensure_backup_dirs
     BACKUP_CRON_MODE=0
     parse_backup_now_args "$@" || return 1
+    requested_profile="$BACKUP_PROFILE_NAME"
+    requested_schedule="$BACKUP_SCHEDULE_CONFIG_NAME"
+    cron_mode="$BACKUP_CRON_MODE"
 
     if [[ "$BACKUP_CRON_MODE" -eq 0 ]]; then
         echo
@@ -3149,17 +3270,35 @@ cmd_backup_now() {
         echo
     fi
 
-    if [[ -n "$BACKUP_PROFILE_NAME" ]]; then
-        load_backup_profile "$BACKUP_PROFILE_NAME" || return 1
+    if [[ "$cron_mode" -eq 1 ]]; then
+        if [[ -z "$requested_profile" ]]; then
+            HOSTCTL_ERROR_HANDLED=1
+            error "--profile was not provided"
+            return 1
+        fi
+        if [[ -z "$requested_schedule" ]]; then
+            HOSTCTL_ERROR_HANDLED=1
+            error "--schedule-config was not provided"
+            return 1
+        fi
+    fi
+
+    if [[ -n "$requested_profile" ]]; then
+        load_backup_profile "$requested_profile" || return 1
+        BACKUP_CRON_MODE="$cron_mode"
+        BACKUP_SCHEDULE_CONFIG_NAME="$requested_schedule"
         if [[ "$BACKUP_CRON_MODE" -eq 1 ]]; then
-            if [[ -n "$BACKUP_SCHEDULE_CONFIG_NAME" ]]; then
-                load_backup_schedule_config "$BACKUP_SCHEDULE_CONFIG_NAME" || return 1
-            elif [[ -z "$BACKUP_DESTINATION" ]]; then
-                error "Cron backup requires --schedule-config for destination settings."
-                return 1
-            else
-                warning "Using legacy destination fields from DB profile."
-            fi
+            BACKUP_DESTINATION=""
+            BACKUP_LOCAL_PATH=""
+            BACKUP_LOCAL_RETENTION_DAYS=""
+            BACKUP_RCLONE_REMOTE=""
+            BACKUP_RCLONE_PATH=""
+            load_backup_schedule_config "$BACKUP_SCHEDULE_CONFIG_NAME" || return 1
+            echo "Backup Profile: ${BACKUP_PROFILE_NAME}"
+            echo "Schedule Config: ${BACKUP_SCHEDULE_CONFIG_NAME}"
+            echo "Destination: ${BACKUP_DESTINATION}"
+            echo "Local Path: ${BACKUP_LOCAL_PATH:-}"
+            echo "Remote: $(rclone_remote_target)"
         else
             collect_destination_config || return 1
         fi
