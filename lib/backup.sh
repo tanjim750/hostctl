@@ -53,7 +53,12 @@ BACKUP_PREFLIGHT_DONE=0
 BACKUP_RESTORE_SAFETY_FILE=""
 BACKUP_ACTIVE_TEMP_FILES=""
 BACKUP_ACTIVE_CHILD_PID=""
+BACKUP_ACTIVE_CONTAINER_PG_PATTERN=""
+BACKUP_ACTIVE_CONTAINER_PG_PID=""
+BACKUP_DUMP_START_EPOCH=""
+BACKUP_LOCK_META_PATH=""
 BACKUP_COMMAND_TIMEOUT="${BACKUP_COMMAND_TIMEOUT:-1800}"
+BACKUP_PG_LOCK_TIMEOUT="${BACKUP_PG_LOCK_TIMEOUT:-10s}"
 BACKUP_OPERATION_CONTEXT="backup"
 
 # ---------------------------------------------------------
@@ -158,6 +163,10 @@ reset_backup_config() {
     BACKUP_RESTORE_SAFETY_FILE=""
     BACKUP_ACTIVE_TEMP_FILES=""
     BACKUP_ACTIVE_CHILD_PID=""
+    BACKUP_ACTIVE_CONTAINER_PG_PATTERN=""
+    BACKUP_ACTIVE_CONTAINER_PG_PID=""
+    BACKUP_DUMP_START_EPOCH=""
+    BACKUP_LOCK_META_PATH=""
     BACKUP_OPERATION_CONTEXT="backup"
 }
 
@@ -968,6 +977,46 @@ docker_target_exec_input_env() {
     docker exec -i "${env_args[@]}" "$BACKUP_RUNTIME_CONTAINER" "$@"
 }
 
+cleanup_active_container_pg_dump() {
+    local pattern="${BACKUP_ACTIVE_CONTAINER_PG_PATTERN:-}"
+
+    [[ -n "$pattern" && -n "${BACKUP_RUNTIME_CONTAINER:-}" ]] || return 0
+    docker exec "$BACKUP_RUNTIME_CONTAINER" sh -c 'pkill -TERM -f "$1" 2>/dev/null || true' sh "$pattern" 2>/dev/null || true
+    sleep 1
+    docker exec "$BACKUP_RUNTIME_CONTAINER" sh -c 'pkill -KILL -f "$1" 2>/dev/null || true' sh "$pattern" 2>/dev/null || true
+    BACKUP_ACTIVE_CONTAINER_PG_PATTERN=""
+    BACKUP_ACTIVE_CONTAINER_PG_PID=""
+}
+
+cleanup_backup_lock_metadata() {
+    [[ -n "${BACKUP_LOCK_META_PATH:-}" ]] && rm -f "$BACKUP_LOCK_META_PATH" 2>/dev/null || true
+    BACKUP_LOCK_META_PATH=""
+}
+
+write_backup_lock_metadata() {
+    local path="$1"
+    local lock_name="$2"
+
+    BACKUP_LOCK_META_PATH="$path"
+    {
+        printf 'HOSTCTL_PID=%s\n' "$$"
+        printf 'LOCK_NAME=%s\n' "$lock_name"
+        printf 'START_TIME=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf 'SOURCE_MODE=%s\n' "${BACKUP_SOURCE_MODE:-}"
+        printf 'DB_TYPE=%s\n' "${BACKUP_DB_TYPE:-}"
+        printf 'DATABASE=%s\n' "${BACKUP_DB_NAME:-}"
+        printf 'RUNTIME_CONTAINER=%s\n' "${BACKUP_RUNTIME_CONTAINER:-}"
+    } > "$path" 2>/dev/null || true
+}
+
+append_backup_lock_metadata() {
+    local key="$1"
+    local value="$2"
+
+    [[ -n "${BACKUP_LOCK_META_PATH:-}" ]] || return 0
+    printf '%s=%s\n' "$key" "$value" >> "$BACKUP_LOCK_META_PATH" 2>/dev/null || true
+}
+
 docker_target_image() {
     if [[ -n "${BACKUP_RUNTIME_CONTAINER:-}" ]]; then
         container_image_for_display "$BACKUP_RUNTIME_CONTAINER"
@@ -1284,6 +1333,8 @@ docker_postgres_exec_noninteractive() {
         "PGPASSWORD=${password}" \
         "PGCONNECT_TIMEOUT=10" \
         "PGPASSFILE=/dev/null" \
+        "PGAPPNAME=hostctl_pg_dump" \
+        "PGOPTIONS=-c lock_timeout=${BACKUP_PG_LOCK_TIMEOUT} -c statement_timeout=0" \
         "$@"
 }
 
@@ -1298,10 +1349,135 @@ docker_postgres_exec_input_noninteractive() {
         "$@"
 }
 
+docker_postgres_current_pg_dump_pids() {
+    local pattern="$1"
+
+    [[ -n "$pattern" ]] || return 0
+    docker exec "$BACKUP_RUNTIME_CONTAINER" sh -c 'pgrep -f "$1" 2>/dev/null || true' sh "$pattern" 2>/dev/null || true
+}
+
+detect_docker_postgres_dump_blocking() {
+    local password="$1"
+    local mode="$2"
+    shift 2
+    local args=("$@")
+    local blockers
+
+    blockers="$(
+        docker_postgres_exec_noninteractive "$password" \
+            psql "${args[@]}" -d "$BACKUP_DB_NAME" -Atc \
+            "SELECT COALESCE(string_agg(DISTINCT b::text, ','), '') FROM pg_stat_activity a CROSS JOIN LATERAL unnest(pg_blocking_pids(a.pid)) b WHERE a.application_name = 'hostctl_pg_dump' AND a.datname = current_database();" \
+            2>/dev/null || true
+    )"
+    blockers="$(awk 'NF { print; exit }' <<< "$blockers")"
+    if [[ -n "$blockers" ]]; then
+        error "pg_dump is waiting on a PostgreSQL lock."
+        error "Blocking PID(s): ${blockers}"
+        return 1
+    fi
+    return 0
+}
+
+run_docker_postgres_dump_command_to_file() {
+    local failure_label="$1"
+    local output_file="$2"
+    local password="$3"
+    local mode="$4"
+    shift 4
+    local args=("$@")
+    local error_file
+    local rc=0
+    local pid
+    local elapsed=0
+    local blocked=0
+    local pids
+
+    error_file="$(mktemp)"
+    BACKUP_DUMP_START_EPOCH="$(date '+%s')"
+    BACKUP_ACTIVE_CONTAINER_PG_PATTERN="pg_dump.*${BACKUP_DB_USER}.*${BACKUP_DB_NAME}"
+
+    info "hostctl PID: $$"
+    info "Dump start time: $(date '+%Y-%m-%d %H:%M:%S')"
+    append_backup_lock_metadata "DUMP_START_EPOCH" "$BACKUP_DUMP_START_EPOCH"
+    append_backup_lock_metadata "HOSTCTL_PID" "$$"
+
+    set +e
+    docker_postgres_exec_noninteractive "$password" pg_dump "${args[@]}" "$BACKUP_DB_NAME" > "$output_file" 2>"$error_file" &
+    pid=$!
+    BACKUP_ACTIVE_CHILD_PID="$pid"
+    info "docker exec PID: ${pid}"
+    append_backup_lock_metadata "DOCKER_EXEC_PID" "$pid"
+
+    while kill -0 "$pid" 2>/dev/null; do
+        pids="$(docker_postgres_current_pg_dump_pids "$BACKUP_ACTIVE_CONTAINER_PG_PATTERN")"
+        if [[ -n "$pids" && -z "${BACKUP_ACTIVE_CONTAINER_PG_PID:-}" ]]; then
+            BACKUP_ACTIVE_CONTAINER_PG_PID="$(tr '\n' ',' <<< "$pids" | sed 's/,$//')"
+            info "Container pg_dump PID: ${BACKUP_ACTIVE_CONTAINER_PG_PID}"
+            append_backup_lock_metadata "CONTAINER_PG_DUMP_PID" "$BACKUP_ACTIVE_CONTAINER_PG_PID"
+        fi
+
+        if (( elapsed >= BACKUP_COMMAND_TIMEOUT )); then
+            cleanup_active_container_pg_dump
+            pkill -TERM -P "$pid" 2>/dev/null || true
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 2
+            pkill -KILL -P "$pid" 2>/dev/null || true
+            kill -KILL "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            rc=124
+            break
+        fi
+
+        if ! detect_docker_postgres_dump_blocking "$password" "$mode" "${args[@]}"; then
+            blocked=1
+            cleanup_active_container_pg_dump
+            pkill -TERM -P "$pid" 2>/dev/null || true
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 1
+            pkill -KILL -P "$pid" 2>/dev/null || true
+            kill -KILL "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            rc=75
+            break
+        fi
+
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+
+    if [[ "$rc" -eq 0 ]]; then
+        wait "$pid"
+        rc=$?
+    fi
+    set -e
+
+    BACKUP_ACTIVE_CHILD_PID=""
+    BACKUP_ACTIVE_CONTAINER_PG_PATTERN=""
+    BACKUP_ACTIVE_CONTAINER_PG_PID=""
+    BACKUP_DUMP_START_EPOCH=""
+
+    if [[ "$rc" -ne 0 ]]; then
+        [[ -s "$error_file" ]] && cat "$error_file" >&2
+        if timeout_status_is_timeout "$rc"; then
+            error "$failure_label timed out."
+        elif [[ "$blocked" -ne 1 ]]; then
+            error "$failure_label failed with exit code ${rc}."
+        fi
+        info "No valid backup file was created."
+        BACKUP_LAST_ERROR="$failure_label failed"
+        rm -f "$error_file"
+        return "$rc"
+    fi
+
+    rm -f "$error_file"
+    return 0
+}
+
 test_docker_postgres_backup_connection() {
     local password
     local mode
     local args=()
+    local arg
 
     password="$(backup_password_env_prefix)"
     mode="$(docker_postgres_connection_mode)" || return 1
@@ -1324,6 +1500,7 @@ dump_docker_postgres_to_file() {
     local password
     local mode
     local args=()
+    local arg
 
     password="$(backup_password_env_prefix)"
     mode="$(docker_postgres_connection_mode)" || return 1
@@ -1345,8 +1522,7 @@ dump_docker_postgres_to_file() {
     info "User: ${BACKUP_DB_USER}"
     info "Command timeout: ${BACKUP_COMMAND_TIMEOUT}s"
     info "Starting pg_dump..."
-    run_dump_command_to_file "$(backup_operation_label "PostgreSQL")" "$output_file" \
-        docker_postgres_exec_noninteractive "$password" pg_dump "${args[@]}" "$BACKUP_DB_NAME"
+    run_docker_postgres_dump_command_to_file "$(backup_operation_label "PostgreSQL")" "$output_file" "$password" "$mode" "${args[@]}"
 }
 
 resolve_required_env_value() {
@@ -2368,6 +2544,7 @@ timeout_command() {
 
     while kill -0 "$pid" 2>/dev/null; do
         if (( elapsed >= timeout_seconds )); then
+            cleanup_active_container_pg_dump
             pkill -TERM -P "$pid" 2>/dev/null || true
             kill -TERM "$pid" 2>/dev/null || true
             sleep 2
@@ -2706,6 +2883,16 @@ validate_backup_destination_before_dump() {
     esac
 }
 
+cleanup_failed_backup_tmp_files() {
+    local output_dir="$1"
+
+    [[ -d "$output_dir" ]] || return 0
+    find "$output_dir" -maxdepth 1 -type f \( -name '*.tmp' -o -name '*.sql.tmp' \) -print |
+        while IFS= read -r temp_file; do
+            rm -f "$temp_file" 2>/dev/null || true
+        done
+}
+
 upload_backup_remote() {
     local file="$1"
 
@@ -2763,6 +2950,7 @@ run_database_backup() {
     output_dir="$BACKUP_LOCAL_PATH"
     [[ -n "$output_dir" ]] || output_dir="${BACKUP_DATABASE_DIR}/$(sanitize_backup_name "$profile")"
     validate_backup_destination_before_dump "$output_dir" || return 1
+    cleanup_failed_backup_tmp_files "$output_dir"
     backup_disk_space_check "$output_dir" || return 1
 
     output_file="${output_dir}/$(backup_filename "$prefix")"
@@ -2870,10 +3058,12 @@ with_backup_lock() {
     shift
     local lock_name
     local lock_path
+    local meta_path
     local rc
 
     lock_name="$(sanitize_backup_name "$profile")"
     lock_path="/tmp/hostctl-backup-${lock_name}.lock"
+    meta_path="/tmp/hostctl-backup-${lock_name}.meta"
 
     if command_exists flock; then
         exec 9>"$lock_path"
@@ -2883,10 +3073,12 @@ with_backup_lock() {
             exec 9>&-
             return 75
         fi
+        write_backup_lock_metadata "$meta_path" "$lock_name"
         set +e
         "$@"
         rc=$?
         set -e
+        cleanup_backup_lock_metadata
         exec 9>&-
         return "$rc"
     else
@@ -3542,6 +3734,7 @@ restore_interrupted() {
     local temp_file
 
     warning "Restore interrupted."
+    cleanup_active_container_pg_dump
     if [[ -n "${BACKUP_ACTIVE_CHILD_PID:-}" ]]; then
         pkill -TERM -P "$BACKUP_ACTIVE_CHILD_PID" 2>/dev/null || true
         kill -TERM "$BACKUP_ACTIVE_CHILD_PID" 2>/dev/null || true
@@ -3559,6 +3752,7 @@ restore_interrupted() {
     if [[ -n "${BACKUP_RESTORE_SAFETY_FILE:-}" ]]; then
         info "Safety backup preserved at: ${BACKUP_RESTORE_SAFETY_FILE}"
     fi
+    cleanup_backup_lock_metadata
     return 130
 }
 
@@ -3570,6 +3764,7 @@ backup_interrupted() {
     else
         warning "Backup interrupted."
     fi
+    cleanup_active_container_pg_dump
     if [[ -n "${BACKUP_ACTIVE_CHILD_PID:-}" ]]; then
         pkill -TERM -P "$BACKUP_ACTIVE_CHILD_PID" 2>/dev/null || true
         kill -TERM "$BACKUP_ACTIVE_CHILD_PID" 2>/dev/null || true
@@ -3587,6 +3782,7 @@ backup_interrupted() {
     if [[ -n "${BACKUP_RESTORE_SAFETY_FILE:-}" ]]; then
         info "Safety backup preserved at: ${BACKUP_RESTORE_SAFETY_FILE}"
     fi
+    cleanup_backup_lock_metadata
     return 130
 }
 
