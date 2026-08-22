@@ -51,6 +51,10 @@ BACKUP_LAST_RESULT=""
 BACKUP_LAST_ERROR=""
 BACKUP_PREFLIGHT_DONE=0
 BACKUP_RESTORE_SAFETY_FILE=""
+BACKUP_ACTIVE_TEMP_FILES=""
+BACKUP_ACTIVE_CHILD_PID=""
+BACKUP_COMMAND_TIMEOUT="${BACKUP_COMMAND_TIMEOUT:-1800}"
+BACKUP_OPERATION_CONTEXT="backup"
 
 # ---------------------------------------------------------
 # Common helpers
@@ -151,6 +155,10 @@ reset_backup_config() {
     BACKUP_LAST_RESULT=""
     BACKUP_LAST_ERROR=""
     BACKUP_PREFLIGHT_DONE=0
+    BACKUP_RESTORE_SAFETY_FILE=""
+    BACKUP_ACTIVE_TEMP_FILES=""
+    BACKUP_ACTIVE_CHILD_PID=""
+    BACKUP_OPERATION_CONTEXT="backup"
 }
 
 backup_config_default_profile_name() {
@@ -2165,6 +2173,58 @@ backup_password_env_prefix() {
     fi
 }
 
+timeout_command() {
+    local timeout_seconds="$1"
+    shift
+    local pid
+    local elapsed=0
+    local rc
+
+    if [[ ! "$timeout_seconds" =~ ^[0-9]+$ || "$timeout_seconds" -le 0 ]]; then
+        "$@"
+        return $?
+    fi
+
+    "$@" &
+    pid=$!
+    BACKUP_ACTIVE_CHILD_PID="$pid"
+
+    while kill -0 "$pid" 2>/dev/null; do
+        if (( elapsed >= timeout_seconds )); then
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 2
+            kill -KILL "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            BACKUP_ACTIVE_CHILD_PID=""
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    set +e
+    wait "$pid"
+    rc=$?
+    set -e
+    BACKUP_ACTIVE_CHILD_PID=""
+    return "$rc"
+}
+
+timeout_status_is_timeout() {
+    local rc="$1"
+    [[ "$rc" -eq 124 || "$rc" -eq 137 || "$rc" -eq 143 ]]
+}
+
+backup_operation_label() {
+    local engine="$1"
+
+    if [[ "${BACKUP_OPERATION_CONTEXT:-backup}" == "safety" ]]; then
+        printf '%s safety backup\n' "$engine"
+    else
+        printf '%s backup\n' "$engine"
+    fi
+}
+
 run_dump_command_to_file() {
     local failure_label="$1"
     local output_file="$2"
@@ -2174,7 +2234,7 @@ run_dump_command_to_file() {
 
     error_file="$(mktemp)"
     set +e
-    "$@" > "$output_file" 2>"$error_file"
+    timeout_command "$BACKUP_COMMAND_TIMEOUT" "$@" > "$output_file" 2>"$error_file"
     rc=$?
     set -e
 
@@ -2182,7 +2242,11 @@ run_dump_command_to_file() {
         if [[ -s "$error_file" ]]; then
             cat "$error_file" >&2
         fi
-        error "$failure_label failed."
+        if timeout_status_is_timeout "$rc"; then
+            error "$failure_label timed out."
+        else
+            error "$failure_label failed."
+        fi
         info "No valid backup file was created."
         BACKUP_LAST_ERROR="$failure_label failed"
         rm -f "$error_file"
@@ -2201,13 +2265,17 @@ run_command_capture_stderr() {
 
     error_file="$(mktemp)"
     set +e
-    "$@" 2>"$error_file"
+    timeout_command "$BACKUP_COMMAND_TIMEOUT" "$@" 2>"$error_file"
     rc=$?
     set -e
 
     if [[ "$rc" -ne 0 ]]; then
         [[ -s "$error_file" ]] && cat "$error_file" >&2
-        error "$failure_label failed."
+        if timeout_status_is_timeout "$rc"; then
+            error "$failure_label timed out."
+        else
+            error "$failure_label failed."
+        fi
         info "No valid backup file was created."
         BACKUP_LAST_ERROR="$failure_label failed"
         rm -f "$error_file"
@@ -2224,33 +2292,33 @@ docker_dump_database_to_sql() {
 
     case "$BACKUP_DB_TYPE" in
         postgresql|postgres)
-            info "Creating PostgreSQL dump..."
+            info "Starting pg_dump..."
             password="$(backup_password_env_prefix)"
             if [[ -n "$password" ]]; then
-                run_dump_command_to_file "PostgreSQL backup" "$sql_file" \
+                run_dump_command_to_file "$(backup_operation_label "PostgreSQL")" "$sql_file" \
                     docker_target_exec env "PGPASSWORD=${password}" \
                     pg_dump -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             else
-                run_dump_command_to_file "PostgreSQL backup" "$sql_file" \
+                run_dump_command_to_file "$(backup_operation_label "PostgreSQL")" "$sql_file" \
                     docker_target_exec \
                     pg_dump -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             fi
             ;;
         mysql|mariadb)
-            info "Creating MySQL/MariaDB dump..."
+            info "Starting mysqldump..."
             password="$(backup_password_env_prefix)"
             if [[ -n "$password" ]]; then
-                run_dump_command_to_file "MySQL/MariaDB backup" "$sql_file" \
+                run_dump_command_to_file "$(backup_operation_label "MySQL/MariaDB")" "$sql_file" \
                     docker_target_exec env "MYSQL_PWD=${password}" \
                     "$(docker_mysql_dump_command_name)" --no-tablespaces -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             else
-                run_dump_command_to_file "MySQL/MariaDB backup" "$sql_file" \
+                run_dump_command_to_file "$(backup_operation_label "MySQL/MariaDB")" "$sql_file" \
                     docker_mysql_dump_exec --no-tablespaces -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             fi
             ;;
         mongodb)
-            info "Creating MongoDB dump..."
-            run_dump_command_to_file "MongoDB backup" "$sql_file" \
+            info "Starting mongodump..."
+            run_dump_command_to_file "$(backup_operation_label "MongoDB")" "$sql_file" \
                 docker_target_exec mongodump --uri="$(mongo_connection_uri)" --archive --gzip
             ;;
     esac
@@ -2264,13 +2332,13 @@ native_dump_database_to_sql() {
     case "$BACKUP_DB_TYPE" in
         postgresql|postgres)
             command_exists pg_dump || { error "pg_dump not found."; return 1; }
-            info "Creating PostgreSQL dump..."
+            info "Starting pg_dump..."
             password="$(backup_password_env_prefix)"
             if [[ -n "$password" ]]; then
-                run_dump_command_to_file "PostgreSQL backup" "$sql_file" \
+                run_dump_command_to_file "$(backup_operation_label "PostgreSQL")" "$sql_file" \
                     env "PGPASSWORD=${password}" pg_dump -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             else
-                run_dump_command_to_file "PostgreSQL backup" "$sql_file" \
+                run_dump_command_to_file "$(backup_operation_label "PostgreSQL")" "$sql_file" \
                     pg_dump -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             fi
             ;;
@@ -2283,20 +2351,20 @@ native_dump_database_to_sql() {
                 error "mysqldump/mariadb-dump not found."
                 return 1
             fi
-            info "Creating MySQL/MariaDB dump..."
+            info "Starting mysqldump..."
             password="$(backup_password_env_prefix)"
             if [[ -n "$password" ]]; then
-                run_dump_command_to_file "MySQL/MariaDB backup" "$sql_file" \
+                run_dump_command_to_file "$(backup_operation_label "MySQL/MariaDB")" "$sql_file" \
                     env "MYSQL_PWD=${password}" "$dump_cmd" --no-tablespaces -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             else
-                run_dump_command_to_file "MySQL/MariaDB backup" "$sql_file" \
+                run_dump_command_to_file "$(backup_operation_label "MySQL/MariaDB")" "$sql_file" \
                     "$dump_cmd" --no-tablespaces -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             fi
             ;;
         mongodb)
             command_exists mongodump || { error "mongodump not found."; return 1; }
-            info "Creating MongoDB dump..."
-            run_command_capture_stderr "MongoDB backup" \
+            info "Starting mongodump..."
+            run_command_capture_stderr "$(backup_operation_label "MongoDB")" \
                 mongodump --uri="$(mongo_connection_uri)" --archive="$sql_file" --gzip
             ;;
     esac
@@ -2347,16 +2415,20 @@ create_database_dump() {
 
     if [[ "$BACKUP_DB_TYPE" == "mongodb" ]]; then
         tmp_gz="${output_file}.tmp"
+        BACKUP_ACTIVE_TEMP_FILES="$tmp_gz"
         rm -f "$tmp_gz"
         if ! dump_database_to_sql "$tmp_gz"; then
             rm -f "$tmp_gz"
+            BACKUP_ACTIVE_TEMP_FILES=""
             return 1
         fi
         validate_backup_file "$tmp_gz" || {
             rm -f "$tmp_gz"
+            BACKUP_ACTIVE_TEMP_FILES=""
             return 1
         }
         mv "$tmp_gz" "$output_file"
+        BACKUP_ACTIVE_TEMP_FILES=""
         success "Database dump created."
         success "Backup integrity verified."
         return 0
@@ -2364,31 +2436,37 @@ create_database_dump() {
 
     tmp_sql="${output_file}.sql.tmp"
     tmp_gz="${output_file}.tmp"
+    BACKUP_ACTIVE_TEMP_FILES="${tmp_sql}"$'\n'"${tmp_gz}"
     rm -f "$tmp_sql" "$tmp_gz"
 
     if ! dump_database_to_sql "$tmp_sql"; then
         rm -f "$tmp_sql" "$tmp_gz"
+        BACKUP_ACTIVE_TEMP_FILES=""
         return 1
     fi
 
     [[ -s "$tmp_sql" ]] || {
         rm -f "$tmp_sql" "$tmp_gz"
+        BACKUP_ACTIVE_TEMP_FILES=""
         error "Database dump produced an empty file."
         return 1
     }
 
     gzip -c "$tmp_sql" > "$tmp_gz" || {
         rm -f "$tmp_sql" "$tmp_gz"
+        BACKUP_ACTIVE_TEMP_FILES=""
         return 1
     }
     rm -f "$tmp_sql"
 
     validate_backup_file "$tmp_gz" || {
         rm -f "$tmp_gz"
+        BACKUP_ACTIVE_TEMP_FILES=""
         return 1
     }
 
     mv "$tmp_gz" "$output_file"
+    BACKUP_ACTIVE_TEMP_FILES=""
     success "Database dump created."
     success "Backup integrity verified."
 }
@@ -2439,6 +2517,11 @@ apply_local_retention() {
 }
 
 run_database_backup() {
+    local lock_held=0
+    if [[ "${1:-}" == "--lock-held" ]]; then
+        lock_held=1
+        shift
+    fi
     local profile="${1:-one-time}"
     local prefix="${2:-}"
     local local_required="no"
@@ -2467,13 +2550,30 @@ run_database_backup() {
 
     output_file="${output_dir}/$(backup_filename "$prefix")"
 
+    if [[ "$lock_held" -eq 1 && "$prefix" == "pre_restore" ]]; then
+        info "Safety backup lock: inherited from restore"
+        BACKUP_OPERATION_CONTEXT="safety"
+    else
+        BACKUP_OPERATION_CONTEXT="backup"
+    fi
+    if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
+        resolve_backup_executor_runtime || return 1
+        info "Executor: Docker container $(container_name_for_display "$BACKUP_RUNTIME_CONTAINER")"
+    else
+        info "Executor: Host OS"
+    fi
+    info "Database: ${BACKUP_DB_NAME}"
+
     if ! create_database_dump "$output_file"; then
+        BACKUP_OPERATION_CONTEXT="backup"
         BACKUP_LAST_RESULT="Failed"
         BACKUP_LAST_ERROR="BACKUP FAILED"
         [[ "$profile" != "one-time" ]] && write_backup_run_state "$profile"
+        HOSTCTL_ERROR_HANDLED=1
         backup_failure_summary "${BACKUP_LAST_ERROR:-BACKUP FAILED}"
         return 1
     fi
+    BACKUP_OPERATION_CONTEXT="backup"
 
     BACKUP_LAST_LOCAL_FILE="$output_file"
     BACKUP_LAST_SIZE="$(human_size "$output_file")"
@@ -2490,6 +2590,7 @@ run_database_backup() {
         else
             BACKUP_LAST_REMOTE_RESULT="Failed"
             BACKUP_LAST_ERROR="REMOTE UPLOAD FAILED"
+            HOSTCTL_ERROR_HANDLED=1
             error "Remote upload failed."
             echo
             echo "Local backup preserved:"
@@ -2505,6 +2606,7 @@ run_database_backup() {
     if [[ "$exit_code" -eq 0 ]]; then
         BACKUP_LAST_RESULT="Success"
         BACKUP_LAST_ERROR=""
+        [[ "$lock_held" -eq 1 && "$prefix" == "pre_restore" ]] && success "Safety backup completed."
         success "Backup completed successfully."
     else
         BACKUP_LAST_RESULT="Partial"
@@ -2548,21 +2650,35 @@ with_backup_lock() {
     shift
     local lock_name
     local lock_path
+    local rc
 
     lock_name="$(sanitize_backup_name "$profile")"
     lock_path="/tmp/hostctl-backup-${lock_name}.lock"
 
     if command_exists flock; then
-        (
-            flock -n 9 || {
-                warning "Backup already running for profile: ${profile}"
-                exit 75
-            }
-            "$@"
-        ) 9>"$lock_path"
+        exec 9>"$lock_path"
+        if ! flock -n 9; then
+            HOSTCTL_ERROR_HANDLED=1
+            error "Another backup or restore is already running for this database."
+            exec 9>&-
+            return 75
+        fi
+        set +e
+        "$@"
+        rc=$?
+        set -e
+        exec 9>&-
+        return "$rc"
     else
         "$@"
     fi
+}
+
+backup_target_lock_name() {
+    local parts
+
+    parts="${BACKUP_SOURCE_MODE:-unknown}-${BACKUP_DB_TYPE:-db}-${BACKUP_PROJECT_DIR:-native}-${BACKUP_DB_SERVICE:-host}-${BACKUP_DOCKER_CONTAINER:-container}-${BACKUP_DB_HOST:-localhost}-${BACKUP_DB_PORT:-port}-${BACKUP_DB_NAME:-database}"
+    sanitize_backup_name "$parts"
 }
 
 # ---------------------------------------------------------
@@ -2809,7 +2925,8 @@ run_profile_now() {
 
     load_backup_profile "$profile" || return 1
     collect_destination_config || return 1
-    with_backup_lock "$profile" run_database_backup "$profile" || status=$?
+    backup_resolve_runtime_values || return 1
+    with_backup_lock "$(backup_target_lock_name)" run_database_backup --lock-held "$profile" || status=$?
     if [[ "$BACKUP_CRON_MODE" -eq 1 ]]; then
         return "$status"
     fi
@@ -3046,7 +3163,8 @@ cmd_backup_now() {
         else
             collect_destination_config || return 1
         fi
-        with_backup_lock "$BACKUP_PROFILE_NAME" run_database_backup "$BACKUP_PROFILE_NAME" || save_status=$?
+        backup_resolve_runtime_values || return 1
+        with_backup_lock "$(backup_target_lock_name)" run_database_backup --lock-held "$BACKUP_PROFILE_NAME" || save_status=$?
         if [[ "$BACKUP_CRON_MODE" -eq 1 ]]; then
             return "$save_status"
         fi
@@ -3059,7 +3177,8 @@ cmd_backup_now() {
         return 0
     fi
 
-    with_backup_lock "one-time-$(sanitize_backup_name "${BACKUP_DB_NAME:-database}")" run_database_backup "one-time" || save_status=$?
+    backup_resolve_runtime_values || return 1
+    with_backup_lock "$(backup_target_lock_name)" run_database_backup --lock-held "one-time" || save_status=$?
 
     if [[ "$save_status" -eq 0 ]]; then
         if confirm "Save this configuration as a backup profile?" "no"; then
@@ -3170,7 +3289,21 @@ validate_restore_file() {
 }
 
 restore_interrupted() {
+    local temp_file
+
     warning "Restore interrupted."
+    if [[ -n "${BACKUP_ACTIVE_CHILD_PID:-}" ]]; then
+        kill -TERM "$BACKUP_ACTIVE_CHILD_PID" 2>/dev/null || true
+        sleep 1
+        kill -KILL "$BACKUP_ACTIVE_CHILD_PID" 2>/dev/null || true
+        BACKUP_ACTIVE_CHILD_PID=""
+    fi
+    if [[ -n "${BACKUP_ACTIVE_TEMP_FILES:-}" ]]; then
+        while IFS= read -r temp_file; do
+            [[ -n "$temp_file" ]] && rm -f "$temp_file" 2>/dev/null || true
+        done <<< "$BACKUP_ACTIVE_TEMP_FILES"
+        BACKUP_ACTIVE_TEMP_FILES=""
+    fi
     if [[ -n "${BACKUP_RESTORE_SAFETY_FILE:-}" ]]; then
         info "Safety backup preserved at: ${BACKUP_RESTORE_SAFETY_FILE}"
     fi
@@ -3180,21 +3313,46 @@ restore_interrupted() {
 sql_stream_restore() {
     local file="$1"
     shift
+    local rc
+    local statuses=()
+    local label
 
+    label="$(db_engine_label "$BACKUP_DB_TYPE") restore"
+
+    set +e
     if [[ "$file" == *.gz ]]; then
-        gzip -dc "$file" | "$@"
+        gzip -dc "$file" | timeout_command "$BACKUP_COMMAND_TIMEOUT" "$@"
+        statuses=("${PIPESTATUS[@]}")
+        if [[ "${statuses[0]}" -ne 0 ]]; then
+            rc="${statuses[0]}"
+        else
+            rc="${statuses[1]}"
+        fi
     else
-        "$@" < "$file"
+        timeout_command "$BACKUP_COMMAND_TIMEOUT" "$@" < "$file"
+        rc=$?
     fi
+    set -e
+
+    if [[ "$rc" -ne 0 ]]; then
+        if timeout_status_is_timeout "$rc"; then
+            error "$label timed out."
+        else
+            error "$label failed."
+        fi
+        return "$rc"
+    fi
+
+    return 0
 }
 
 docker_postgres_exec() {
     local password
     password="$(backup_password_env_prefix)"
     if [[ -n "$password" ]]; then
-        docker_target_exec env "PGPASSWORD=${password}" psql -v ON_ERROR_STOP=1 -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
+        timeout_command "$BACKUP_COMMAND_TIMEOUT" docker_target_exec env "PGPASSWORD=${password}" psql -v ON_ERROR_STOP=1 -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
     else
-        docker_target_exec psql -v ON_ERROR_STOP=1 -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
+        timeout_command "$BACKUP_COMMAND_TIMEOUT" docker_target_exec psql -v ON_ERROR_STOP=1 -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
     fi
 }
 
@@ -3202,9 +3360,9 @@ native_postgres_exec() {
     local password
     password="$(backup_password_env_prefix)"
     if [[ -n "$password" ]]; then
-        env "PGPASSWORD=${password}" psql -v ON_ERROR_STOP=1 -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
+        timeout_command "$BACKUP_COMMAND_TIMEOUT" env "PGPASSWORD=${password}" psql -v ON_ERROR_STOP=1 -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
     else
-        psql -v ON_ERROR_STOP=1 -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
+        timeout_command "$BACKUP_COMMAND_TIMEOUT" psql -v ON_ERROR_STOP=1 -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
     fi
 }
 
@@ -3212,9 +3370,9 @@ docker_mysql_exec() {
     local password
     password="$(backup_password_env_prefix)"
     if [[ -n "$password" ]]; then
-        docker_target_exec env "MYSQL_PWD=${password}" "$(docker_mysql_client_command_name)" -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$@"
+        timeout_command "$BACKUP_COMMAND_TIMEOUT" docker_target_exec env "MYSQL_PWD=${password}" "$(docker_mysql_client_command_name)" -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$@"
     else
-        docker_mysql_client_exec -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$@"
+        timeout_command "$BACKUP_COMMAND_TIMEOUT" docker_mysql_client_exec -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$@"
     fi
 }
 
@@ -3222,9 +3380,9 @@ docker_mysql_exec_input() {
     local password
     password="$(backup_password_env_prefix)"
     if [[ -n "$password" ]]; then
-        docker_target_exec_input env "MYSQL_PWD=${password}" "$(docker_mysql_client_command_name)" -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$@"
+        timeout_command "$BACKUP_COMMAND_TIMEOUT" docker_target_exec_input env "MYSQL_PWD=${password}" "$(docker_mysql_client_command_name)" -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$@"
     else
-        docker_mysql_client_exec_input -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$@"
+        timeout_command "$BACKUP_COMMAND_TIMEOUT" docker_mysql_client_exec_input -h "${BACKUP_DB_HOST:-127.0.0.1}" -P "${BACKUP_DB_PORT:-3306}" -u "$BACKUP_DB_USER" "$@"
     fi
 }
 
@@ -3242,9 +3400,9 @@ native_mysql_exec() {
     password="$(backup_password_env_prefix)"
     mysql_cmd="$(native_mysql_command_name)"
     if [[ -n "$password" ]]; then
-        env "MYSQL_PWD=${password}" "$mysql_cmd" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$@"
+        timeout_command "$BACKUP_COMMAND_TIMEOUT" env "MYSQL_PWD=${password}" "$mysql_cmd" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$@"
     else
-        "$mysql_cmd" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$@"
+        timeout_command "$BACKUP_COMMAND_TIMEOUT" "$mysql_cmd" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$@"
     fi
 }
 
@@ -3288,17 +3446,64 @@ download_remote_restore_file() {
     local remote
     local remote_path
     local local_file
+    local listing
+    local list_rc
+    local error_file
 
     ensure_rclone_available_for_backup || return 1
     remote="$(select_rclone_remote)" || return 1
-    remote_path="$(ask_input "Remote backup path" "hostctl/backups")" || return 1
-    remote_base="${remote}${remote_path}"
 
-    while IFS= read -r file; do
-        [[ -n "$file" ]] && files+=("$file")
-    done < <(rclone lsf "$remote_base" --files-only 2>/dev/null | awk '/(\.sql(\.gz)?|\.archive\.gz)$/')
+    while true; do
+        remote_path="$(ask_input "Remote backup path" "hostctl/backups")" || return 1
+        remote_base="${remote}${remote_path}"
+        files=()
+        error_file="$(mktemp)"
 
-    [[ "${#files[@]}" -gt 0 ]] || { error "No remote backup files found."; return 1; }
+        set +e
+        listing="$(rclone lsf "$remote_base" --files-only 2>"$error_file")"
+        list_rc=$?
+        set -e
+
+        if [[ "$list_rc" -ne 0 ]]; then
+            [[ -s "$error_file" ]] && cat "$error_file" >&2
+            rm -f "$error_file"
+            error "Failed to list remote backup files: ${remote_base}"
+            return "$list_rc"
+        fi
+        rm -f "$error_file"
+
+        while IFS= read -r file; do
+            [[ -n "$file" ]] && files+=("$file")
+        done < <(awk '/(\.sql(\.gz)?|\.archive\.gz)$/' <<< "$listing")
+
+        if [[ "${#files[@]}" -gt 0 ]]; then
+            break
+        fi
+
+        warning "No backup files found in:"
+        echo "$remote_base" >&2
+        echo >&2
+        choice="$(
+            select_option \
+                "Remote restore:" \
+                "Enter another remote path" \
+                "Select another remote" \
+                "Cancel"
+        )" || return 1
+
+        case "$choice" in
+            "Enter another remote path")
+                continue
+                ;;
+            "Select another remote")
+                remote="$(select_rclone_remote)" || return 1
+                ;;
+            "Cancel")
+                return 1
+                ;;
+        esac
+    done
+
     echo "Remote backup files:" >&2
     local i
     for i in "${!files[@]}"; do
@@ -3357,7 +3562,18 @@ restore_database_from_file() {
                     error "mongorestore not found in selected Docker target."
                     return 1
                 }
-                docker_target_exec_input mongorestore --uri="$(mongo_connection_uri)" --archive --gzip --drop < "$file"
+                set +e
+                timeout_command "$BACKUP_COMMAND_TIMEOUT" docker_target_exec_input mongorestore --uri="$(mongo_connection_uri)" --archive --gzip --drop < "$file"
+                local mongo_rc=$?
+                set -e
+                if [[ "$mongo_rc" -ne 0 ]]; then
+                    if timeout_status_is_timeout "$mongo_rc"; then
+                        error "MongoDB restore timed out."
+                    else
+                        error "MongoDB restore failed."
+                    fi
+                    return "$mongo_rc"
+                fi
                 ;;
         esac
     else
@@ -3379,16 +3595,87 @@ restore_database_from_file() {
             mongodb)
                 [[ "$file" == *.archive.gz ]] || { error "MongoDB restore requires a .archive.gz backup."; return 1; }
                 command_exists mongorestore || { error "mongorestore not found."; return 1; }
-                mongorestore --uri="$(mongo_connection_uri)" --archive="$file" --gzip --drop
+                set +e
+                timeout_command "$BACKUP_COMMAND_TIMEOUT" mongorestore --uri="$(mongo_connection_uri)" --archive="$file" --gzip --drop
+                local mongo_rc=$?
+                set -e
+                if [[ "$mongo_rc" -ne 0 ]]; then
+                    if timeout_status_is_timeout "$mongo_rc"; then
+                        error "MongoDB restore timed out."
+                    else
+                        error "MongoDB restore failed."
+                    fi
+                    return "$mongo_rc"
+                fi
                 ;;
         esac
     fi
 }
 
+run_restore_transaction() {
+    local file="$1"
+    local confirm_name
+    local original_destination
+
+    info "Creating mandatory safety backup before restore..."
+    original_destination="$BACKUP_DESTINATION"
+    trap 'BACKUP_DESTINATION="$original_destination"; restore_interrupted; exit 130' INT
+    BACKUP_DESTINATION="local"
+    BACKUP_LOCAL_PATH="${BACKUP_DATABASE_DIR}/pre-restore"
+    if ! run_database_backup --lock-held "pre-restore-$(sanitize_backup_name "$BACKUP_DB_NAME")" "pre_restore"; then
+        BACKUP_DESTINATION="$original_destination"
+        trap - INT
+        HOSTCTL_ERROR_HANDLED=1
+        error "Safety backup failed. Restore cancelled."
+        return 1
+    fi
+    BACKUP_RESTORE_SAFETY_FILE="$BACKUP_LAST_LOCAL_FILE"
+    BACKUP_DESTINATION="$original_destination"
+    info "Safety backup preserved at: ${BACKUP_RESTORE_SAFETY_FILE}"
+
+    confirm_name="$(ask_input "Type database name to confirm restore")" || {
+        trap - INT
+        return 1
+    }
+    if [[ "$confirm_name" != "$BACKUP_DB_NAME" ]]; then
+        trap - INT
+        warning "Restore cancelled."
+        return 0
+    fi
+
+    restore_database_from_file "$file" || {
+        trap - INT
+        log_event "RESTORE_FAILED database=${BACKUP_DB_NAME}"
+        HOSTCTL_ERROR_HANDLED=1
+        error "RESTORE FAILED"
+        if [[ -n "${BACKUP_RESTORE_SAFETY_FILE:-}" ]]; then
+            info "Safety backup preserved at: ${BACKUP_RESTORE_SAFETY_FILE}"
+        fi
+        return 1
+    }
+    trap - INT
+
+    BACKUP_PREFLIGHT_DONE=0
+    preflight_database_config || {
+        log_event "RESTORE_VALIDATE_FAILED database=${BACKUP_DB_NAME}"
+        HOSTCTL_ERROR_HANDLED=1
+        error "RESTORE VALIDATION FAILED"
+        if [[ -n "${BACKUP_RESTORE_SAFETY_FILE:-}" ]]; then
+            info "Safety backup preserved at: ${BACKUP_RESTORE_SAFETY_FILE}"
+        fi
+        trap - INT
+        return 1
+    }
+
+    trap - INT
+    success "Database restore completed."
+    success "Database connectivity verified."
+    log_event "RESTORE database=${BACKUP_DB_NAME} result=success"
+}
+
 cmd_db_restore() {
     local source_choice
     local file
-    local confirm_name
 
     require_root
     require_debian_based
@@ -3419,7 +3706,7 @@ cmd_db_restore() {
 
     case "$source_choice" in
         "Local") file="$(select_local_restore_file)" || return 1 ;;
-        "Remote via rclone") file="$(download_remote_restore_file)" || return 1 ;;
+        "Remote via rclone") file="$(download_remote_restore_file)" || { warning "Restore cancelled."; return 0; } ;;
     esac
 
     validate_restore_file "$file" || return 1
@@ -3430,48 +3717,6 @@ cmd_db_restore() {
     printf 'Backup: %s\n' "$(basename "$file")"
     echo
 
-    info "Creating mandatory safety backup before restore..."
-    local original_destination="$BACKUP_DESTINATION"
-    BACKUP_DESTINATION="local"
-    BACKUP_LOCAL_PATH="${BACKUP_DATABASE_DIR}/pre-restore"
-    if ! with_backup_lock "pre-restore-$(sanitize_backup_name "$BACKUP_DB_NAME")" run_database_backup "pre-restore-$(sanitize_backup_name "$BACKUP_DB_NAME")" "pre_restore"; then
-        BACKUP_DESTINATION="$original_destination"
-        error "Safety backup failed. Restore cancelled."
-        return 1
-    fi
-    BACKUP_RESTORE_SAFETY_FILE="$BACKUP_LAST_LOCAL_FILE"
-    BACKUP_DESTINATION="$original_destination"
-    info "Safety backup preserved at: ${BACKUP_RESTORE_SAFETY_FILE}"
-
-    confirm_name="$(ask_input "Type database name to confirm restore")" || return 1
-    if [[ "$confirm_name" != "$BACKUP_DB_NAME" ]]; then
-        warning "Restore cancelled."
-        return 0
-    fi
-
-    trap 'restore_interrupted; exit 130' INT
-    restore_database_from_file "$file" || {
-        trap - INT
-        log_event "RESTORE_FAILED database=${BACKUP_DB_NAME}"
-        error "RESTORE FAILED"
-        if [[ -n "${BACKUP_RESTORE_SAFETY_FILE:-}" ]]; then
-            info "Safety backup preserved at: ${BACKUP_RESTORE_SAFETY_FILE}"
-        fi
-        return 1
-    }
-    trap - INT
-
-    BACKUP_PREFLIGHT_DONE=0
-    preflight_database_config || {
-        log_event "RESTORE_VALIDATE_FAILED database=${BACKUP_DB_NAME}"
-        error "RESTORE VALIDATION FAILED"
-        if [[ -n "${BACKUP_RESTORE_SAFETY_FILE:-}" ]]; then
-            info "Safety backup preserved at: ${BACKUP_RESTORE_SAFETY_FILE}"
-        fi
-        return 1
-    }
-
-    success "Database restore completed."
-    success "Database connectivity verified."
-    log_event "RESTORE database=${BACKUP_DB_NAME} result=success"
+    backup_resolve_runtime_values || return 1
+    with_backup_lock "$(backup_target_lock_name)" run_restore_transaction "$file"
 }
