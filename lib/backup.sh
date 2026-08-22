@@ -17,6 +17,9 @@ BACKUP_PROJECT_DIR=""
 BACKUP_COMPOSE_FILE=""
 BACKUP_ENV_FILE=""
 BACKUP_DB_SERVICE=""
+BACKUP_DOCKER_TARGET_TYPE=""
+BACKUP_DOCKER_CONTAINER=""
+BACKUP_DOCKER_IMAGE=""
 BACKUP_DB_HOST=""
 BACKUP_DB_PORT=""
 BACKUP_DB_NAME=""
@@ -24,6 +27,10 @@ BACKUP_DB_USER=""
 BACKUP_DB_NAME_VAR=""
 BACKUP_DB_USER_VAR=""
 BACKUP_DB_PASSWORD_VAR=""
+BACKUP_DB_HOST_VAR=""
+BACKUP_DB_PORT_VAR=""
+BACKUP_MONGO_URI_VAR=""
+BACKUP_MONGO_URI=""
 BACKUP_CREDENTIAL_SOURCE=""
 BACKUP_DESTINATION=""
 BACKUP_LOCAL_PATH=""
@@ -98,6 +105,9 @@ reset_backup_config() {
     BACKUP_COMPOSE_FILE=""
     BACKUP_ENV_FILE=""
     BACKUP_DB_SERVICE=""
+    BACKUP_DOCKER_TARGET_TYPE=""
+    BACKUP_DOCKER_CONTAINER=""
+    BACKUP_DOCKER_IMAGE=""
     BACKUP_DB_HOST=""
     BACKUP_DB_PORT=""
     BACKUP_DB_NAME=""
@@ -105,6 +115,10 @@ reset_backup_config() {
     BACKUP_DB_NAME_VAR=""
     BACKUP_DB_USER_VAR=""
     BACKUP_DB_PASSWORD_VAR=""
+    BACKUP_DB_HOST_VAR=""
+    BACKUP_DB_PORT_VAR=""
+    BACKUP_MONGO_URI_VAR=""
+    BACKUP_MONGO_URI=""
     BACKUP_CREDENTIAL_SOURCE=""
     BACKUP_DESTINATION=""
     BACKUP_LOCAL_PATH=""
@@ -231,17 +245,19 @@ ask_required_input() {
 
 backup_client_name() {
     case "$1" in
-        postgres) printf 'pg_dump\n' ;;
+        postgresql|postgres) printf 'pg_dump\n' ;;
         mysql) printf 'mysqldump\n' ;;
         mariadb) printf 'mariadb-dump or mysqldump\n' ;;
+        mongodb) printf 'mongodump\n' ;;
     esac
 }
 
 db_engine_label() {
     case "$1" in
-        postgres) printf 'PostgreSQL\n' ;;
+        postgresql|postgres) printf 'PostgreSQL\n' ;;
         mysql) printf 'MySQL\n' ;;
         mariadb) printf 'MariaDB\n' ;;
+        mongodb) printf 'MongoDB\n' ;;
         *) printf '%s\n' "$1" ;;
     esac
 }
@@ -267,7 +283,7 @@ backup_disk_space_check() {
 
 profile_key_allowed() {
     case "$1" in
-        PROFILE_NAME|SOURCE_MODE|DB_TYPE|PROJECT_DIR|COMPOSE_FILE|ENV_FILE|DB_SERVICE|DB_HOST|DB_PORT|DB_NAME|DB_USER|DB_NAME_VAR|DB_USER_VAR|DB_PASSWORD_VAR|CREDENTIAL_SOURCE|DESTINATION|LOCAL_PATH|LOCAL_RETENTION_DAYS|RCLONE_REMOTE|RCLONE_PATH)
+        PROFILE_NAME|SOURCE_MODE|DB_TYPE|PROJECT_DIR|COMPOSE_FILE|ENV_FILE|DB_SERVICE|DOCKER_TARGET_TYPE|DOCKER_CONTAINER|DOCKER_IMAGE|DB_HOST|DB_PORT|DB_NAME|DB_USER|DB_NAME_VAR|DB_USER_VAR|DB_PASSWORD_VAR|DB_HOST_VAR|DB_PORT_VAR|MONGO_URI_VAR|CREDENTIAL_SOURCE|DESTINATION|LOCAL_PATH|LOCAL_RETENTION_DAYS|RCLONE_REMOTE|RCLONE_PATH)
             return 0
             ;;
         *)
@@ -288,6 +304,9 @@ set_backup_config_value() {
         COMPOSE_FILE) BACKUP_COMPOSE_FILE="$value" ;;
         ENV_FILE) BACKUP_ENV_FILE="$value" ;;
         DB_SERVICE) BACKUP_DB_SERVICE="$value" ;;
+        DOCKER_TARGET_TYPE) BACKUP_DOCKER_TARGET_TYPE="$value" ;;
+        DOCKER_CONTAINER) BACKUP_DOCKER_CONTAINER="$value" ;;
+        DOCKER_IMAGE) BACKUP_DOCKER_IMAGE="$value" ;;
         DB_HOST) BACKUP_DB_HOST="$value" ;;
         DB_PORT) BACKUP_DB_PORT="$value" ;;
         DB_NAME) BACKUP_DB_NAME="$value" ;;
@@ -295,6 +314,9 @@ set_backup_config_value() {
         DB_NAME_VAR) BACKUP_DB_NAME_VAR="$value" ;;
         DB_USER_VAR) BACKUP_DB_USER_VAR="$value" ;;
         DB_PASSWORD_VAR) BACKUP_DB_PASSWORD_VAR="$value" ;;
+        DB_HOST_VAR) BACKUP_DB_HOST_VAR="$value" ;;
+        DB_PORT_VAR) BACKUP_DB_PORT_VAR="$value" ;;
+        MONGO_URI_VAR) BACKUP_MONGO_URI_VAR="$value" ;;
         CREDENTIAL_SOURCE) BACKUP_CREDENTIAL_SOURCE="$value" ;;
         DESTINATION) BACKUP_DESTINATION="$value" ;;
         LOCAL_PATH) BACKUP_LOCAL_PATH="$value" ;;
@@ -319,6 +341,9 @@ write_backup_profile() {
         printf 'COMPOSE_FILE=%s\n' "$BACKUP_COMPOSE_FILE"
         printf 'ENV_FILE=%s\n' "$BACKUP_ENV_FILE"
         printf 'DB_SERVICE=%s\n' "$BACKUP_DB_SERVICE"
+        printf 'DOCKER_TARGET_TYPE=%s\n' "$BACKUP_DOCKER_TARGET_TYPE"
+        printf 'DOCKER_CONTAINER=%s\n' "$BACKUP_DOCKER_CONTAINER"
+        printf 'DOCKER_IMAGE=%s\n' "$BACKUP_DOCKER_IMAGE"
         printf 'DB_HOST=%s\n' "$BACKUP_DB_HOST"
         printf 'DB_PORT=%s\n' "$BACKUP_DB_PORT"
         printf 'DB_NAME=%s\n' "$BACKUP_DB_NAME"
@@ -326,6 +351,9 @@ write_backup_profile() {
         printf 'DB_NAME_VAR=%s\n' "$BACKUP_DB_NAME_VAR"
         printf 'DB_USER_VAR=%s\n' "$BACKUP_DB_USER_VAR"
         printf 'DB_PASSWORD_VAR=%s\n' "$BACKUP_DB_PASSWORD_VAR"
+        printf 'DB_HOST_VAR=%s\n' "$BACKUP_DB_HOST_VAR"
+        printf 'DB_PORT_VAR=%s\n' "$BACKUP_DB_PORT_VAR"
+        printf 'MONGO_URI_VAR=%s\n' "$BACKUP_MONGO_URI_VAR"
         printf 'CREDENTIAL_SOURCE=%s\n' "$BACKUP_CREDENTIAL_SOURCE"
         printf 'DESTINATION=%s\n' "$BACKUP_DESTINATION"
         printf 'LOCAL_PATH=%s\n' "$BACKUP_LOCAL_PATH"
@@ -392,7 +420,8 @@ backup_profile_value() {
 
 validate_loaded_backup_profile() {
     case "$BACKUP_SOURCE_MODE" in docker|native) ;; *) error "Invalid profile source mode."; return 1 ;; esac
-    case "$BACKUP_DB_TYPE" in postgres|mysql|mariadb) ;; *) error "Invalid profile database type."; return 1 ;; esac
+    [[ "$BACKUP_DB_TYPE" == "postgres" ]] && BACKUP_DB_TYPE="postgresql"
+    case "$BACKUP_DB_TYPE" in postgresql|mysql|mariadb|mongodb) ;; *) error "Invalid profile database type."; return 1 ;; esac
     case "$BACKUP_DESTINATION" in local|remote|both) ;; *) error "Invalid profile destination."; return 1 ;; esac
     [[ -n "$BACKUP_LOCAL_RETENTION_DAYS" ]] || BACKUP_LOCAL_RETENTION_DAYS=7
     [[ "$BACKUP_LOCAL_RETENTION_DAYS" =~ ^[0-9]+$ ]] || BACKUP_LOCAL_RETENTION_DAYS=7
@@ -427,134 +456,354 @@ select_db_type() {
             "Database type:" \
             "PostgreSQL" \
             "MySQL" \
-            "MariaDB"
+            "MariaDB" \
+            "MongoDB"
     )" || return 1
 
     case "$choice" in
-        "PostgreSQL") printf 'postgres\n' ;;
+        "PostgreSQL") printf 'postgresql\n' ;;
         "MySQL") printf 'mysql\n' ;;
         "MariaDB") printf 'mariadb\n' ;;
+        "MongoDB") printf 'mongodb\n' ;;
+    esac
+}
+
+compose_exec_all_profiles() {
+    if [[ -n "${ENV_FILE:-}" ]]; then
+        docker compose --profile '*' --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@" 2>/dev/null ||
+            docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+    else
+        docker compose --profile '*' -f "$COMPOSE_FILE" "$@" 2>/dev/null ||
+            docker compose -f "$COMPOSE_FILE" "$@"
+    fi
+}
+
+get_all_compose_services() {
+    compose_exec_all_profiles config --services
+}
+
+compose_service_block() {
+    local service="$1"
+
+    compose_exec_all_profiles config 2>/dev/null | awk -v service="$service" '
+        $1 == service ":" { in_service = 1; next }
+        in_service && /^[[:space:]]{2}[A-Za-z0-9_.-]+:/ { exit }
+        in_service { print }
+    ' || true
+}
+
+compose_service_image() {
+    local service="$1"
+
+    compose_service_block "$service" |
+        awk '$1 == "image:" { print $2; exit }'
+}
+
+image_repo_name() {
+    local image="$1"
+    local repo
+
+    image="${image%@*}"
+    image="${image%%:*}"
+    repo="${image##*/}"
+    printf '%s\n' "$(tr '[:upper:]' '[:lower:]' <<< "$repo")"
+}
+
+image_matches_db_type() {
+    local image="$1"
+    local db_type="$2"
+    local repo
+
+    repo="$(image_repo_name "$image")"
+    case "$db_type" in
+        postgresql|postgres)
+            [[ "$repo" == *postgres* || "$repo" == *postgresql* ]]
+            ;;
+        mysql)
+            [[ "$repo" == *mysql* && "$repo" != *mariadb* ]]
+            ;;
+        mariadb)
+            [[ "$repo" == *mariadb* ]]
+            ;;
+        mongodb)
+            [[ "$repo" == *mongo* || "$repo" == *mongodb* ]]
+            ;;
     esac
 }
 
 detect_docker_db_type_for_service() {
     local service="$1"
-    local service_block
-    local lowered
+    local image
 
-    service_block="$(compose_exec config 2>/dev/null | awk -v service="$service" '
-        $1 == service ":" { in_service = 1; next }
-        in_service && /^[[:space:]]{2}[A-Za-z0-9_.-]+:/ { exit }
-        in_service { print }
-    ' || true)"
-    lowered="$(tr '[:upper:]' '[:lower:]' <<< "${service} ${service_block}")"
+    image="$(compose_service_image "$service")"
+    [[ -n "$image" ]] || return 1
 
-    case "$lowered" in
-        *postgres*|*postgres_db*|*postgres_user*|*5432*) printf 'postgres\n' ;;
-        *mariadb*|*mariadb_database*) printf 'mariadb\n' ;;
-        *mysql*|*mysql_database*|*3306*) printf 'mysql\n' ;;
-        *) return 1 ;;
+    if image_matches_db_type "$image" postgresql; then
+        printf 'postgresql\n'
+    elif image_matches_db_type "$image" mariadb; then
+        printf 'mariadb\n'
+    elif image_matches_db_type "$image" mysql; then
+        printf 'mysql\n'
+    elif image_matches_db_type "$image" mongodb; then
+        printf 'mongodb\n'
+    else
+        return 1
+    fi
+}
+
+docker_target_exec() {
+    if [[ "${BACKUP_DOCKER_TARGET_TYPE:-service}" == "container" ]]; then
+        docker exec "$BACKUP_DOCKER_CONTAINER" "$@"
+    else
+        compose_exec exec -T "$BACKUP_DB_SERVICE" "$@"
+    fi
+}
+
+docker_target_exec_input() {
+    if [[ "${BACKUP_DOCKER_TARGET_TYPE:-service}" == "container" ]]; then
+        docker exec -i "$BACKUP_DOCKER_CONTAINER" "$@"
+    else
+        compose_exec exec -T "$BACKUP_DB_SERVICE" "$@"
+    fi
+}
+
+docker_target_label() {
+    if [[ "${BACKUP_DOCKER_TARGET_TYPE:-service}" == "container" ]]; then
+        printf 'container: %s\n' "$BACKUP_DOCKER_CONTAINER"
+    else
+        printf 'service: %s\n' "$BACKUP_DB_SERVICE"
+    fi
+}
+
+docker_target_image() {
+    if [[ "${BACKUP_DOCKER_TARGET_TYPE:-service}" == "container" ]]; then
+        docker inspect -f '{{.Config.Image}}' "$BACKUP_DOCKER_CONTAINER" 2>/dev/null || true
+    else
+        compose_service_image "$BACKUP_DB_SERVICE"
+    fi
+}
+
+select_custom_docker_target() {
+    local target_type
+    local input
+
+    target_type="$(
+        select_option \
+            "Target type:" \
+            "Compose service" \
+            "Docker container"
+    )" || return 1
+
+    case "$target_type" in
+        "Compose service")
+            while true; do
+                input="$(ask_required_input "Enter Compose service name")" || return 1
+                if get_all_compose_services | awk -v service="$input" '$0 == service { found = 1 } END { exit found ? 0 : 1 }'; then
+                    BACKUP_DOCKER_TARGET_TYPE="service"
+                    BACKUP_DB_SERVICE="$input"
+                    BACKUP_DOCKER_CONTAINER=""
+                    return 0
+                fi
+                warning "Compose service not found: ${input}"
+                confirm "Enter another service?" "yes" || return 1
+            done
+            ;;
+        "Docker container")
+            while true; do
+                input="$(ask_required_input "Enter Docker container name or ID")" || return 1
+                if docker inspect "$input" >/dev/null 2>&1; then
+                    BACKUP_DOCKER_TARGET_TYPE="container"
+                    BACKUP_DOCKER_CONTAINER="$input"
+                    BACKUP_DB_SERVICE=""
+                    return 0
+                fi
+                error "Docker container not found: ${input}"
+                confirm "Enter another container?" "yes" || return 1
+            done
+            ;;
     esac
 }
 
-docker_service_has_client() {
-    local service="$1"
-    local db_type="$2"
+confirm_selected_docker_target() {
+    local image
 
-    case "$db_type" in
-        postgres)
-            compose_exec exec -T "$service" sh -c 'command -v pg_dump >/dev/null 2>&1'
-            ;;
-        mysql)
-            compose_exec exec -T "$service" sh -c 'command -v mysqldump >/dev/null 2>&1'
-            ;;
-        mariadb)
-            compose_exec exec -T "$service" sh -c 'command -v mariadb-dump >/dev/null 2>&1 || command -v mysqldump >/dev/null 2>&1'
-            ;;
-    esac
+    image="$(docker_target_image)"
+    BACKUP_DOCKER_IMAGE="$image"
+
+    echo
+    echo "Selected target:"
+    if [[ "${BACKUP_DOCKER_TARGET_TYPE:-service}" == "container" ]]; then
+        printf 'Container: %s\n' "$BACKUP_DOCKER_CONTAINER"
+    else
+        printf 'Service: %s\n' "$BACKUP_DB_SERVICE"
+    fi
+    printf 'Image: %s\n' "${image:-not declared}"
+    echo
+
+    if [[ -n "$image" ]] && ! image_matches_db_type "$image" "$BACKUP_DB_TYPE"; then
+        warning "Selected target image does not appear to be $(db_engine_label "$BACKUP_DB_TYPE")."
+        confirm "Continue with executable/connectivity verification anyway?" "no" || return 1
+    fi
 }
 
-select_docker_db_service() {
-    local candidates=()
+select_docker_image_candidate() {
+    local candidates=("$@")
+    local choice
+
+    while true; do
+        if [[ -r /dev/tty ]]; then
+            read -r -p "Select [1-$(( ${#candidates[@]} + 4 ))]: " choice </dev/tty || return 1
+        else
+            read -r -p "Select [1-$(( ${#candidates[@]} + 4 ))]: " choice || return 1
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]]; then
+            if (( choice >= 1 && choice <= ${#candidates[@]} )); then
+                BACKUP_DOCKER_TARGET_TYPE="service"
+                BACKUP_DB_SERVICE="${candidates[$((choice - 1))]%%|*}"
+                BACKUP_DOCKER_IMAGE="${candidates[$((choice - 1))]#*|}"
+                return 0
+            fi
+
+            case "$(( choice - ${#candidates[@]} ))" in
+                1) select_available_compose_service_target; return ;;
+                2) select_custom_docker_target; return ;;
+                3) collect_native_database_config; return ;;
+                4) return 1 ;;
+            esac
+        fi
+        warning "Invalid selection."
+    done
+}
+
+select_available_compose_service_target() {
+    local services=()
     local service
-    local db_type
+    local image
     local choice
 
     while IFS= read -r service; do
-        [[ -n "$service" ]] || continue
-        if db_type="$(detect_docker_db_type_for_service "$service" 2>/dev/null)"; then
-            candidates+=("${service}|${db_type}")
-        elif [[ "$service" =~ (db|database|postgres|mysql|mariadb) ]]; then
-            candidates+=("${service}|")
-        fi
-    done < <(get_compose_services || true)
+        [[ -n "$service" ]] && services+=("$service")
+    done < <(get_all_compose_services || true)
 
-    if [[ "${#candidates[@]}" -eq 1 ]]; then
-        BACKUP_DB_SERVICE="${candidates[0]%%|*}"
-        BACKUP_DB_TYPE="${candidates[0]#*|}"
-        [[ -n "$BACKUP_DB_TYPE" ]] || BACKUP_DB_TYPE="$(select_db_type)"
-        echo
-        printf 'Detected %s database service:\n%s\n' "$(db_engine_label "$BACKUP_DB_TYPE")" "$BACKUP_DB_SERVICE"
-        echo
-        if ! confirm "Use this service?" "yes"; then
-            BACKUP_DB_SERVICE=""
-            BACKUP_DB_TYPE=""
-            select_docker_db_service
-            return
-        fi
-        return 0
-    fi
+    [[ "${#services[@]}" -gt 0 ]] || {
+        warning "No Compose services were found."
+        select_custom_docker_target
+        return
+    }
 
-    if [[ "${#candidates[@]}" -gt 1 ]]; then
-        echo "Detected database services:" >&2
-        echo >&2
+    echo
+    echo "Available Compose services:"
+    echo
+    local i
+    for i in "${!services[@]}"; do
+        image="$(compose_service_image "${services[$i]}")"
+        printf '%d. %s\n' "$((i + 1))" "${services[$i]}"
+        printf '   Image: %s\n' "${image:-not declared}"
+    done
+    printf '%d. Custom service/container name\n' "$(( ${#services[@]} + 1 ))"
+    printf '%d. Use native/external database\n' "$(( ${#services[@]} + 2 ))"
+    printf '%d. Cancel\n' "$(( ${#services[@]} + 3 ))"
+
+    while true; do
+        if [[ -r /dev/tty ]]; then
+            read -r -p "Select [1-$(( ${#services[@]} + 3 ))]: " choice </dev/tty || return 1
+        else
+            read -r -p "Select [1-$(( ${#services[@]} + 3 ))]: " choice || return 1
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]]; then
+            if (( choice >= 1 && choice <= ${#services[@]} )); then
+                BACKUP_DOCKER_TARGET_TYPE="service"
+                BACKUP_DB_SERVICE="${services[$((choice - 1))]}"
+                BACKUP_DOCKER_IMAGE="$(compose_service_image "$BACKUP_DB_SERVICE")"
+                return 0
+            elif (( choice == ${#services[@]} + 1 )); then
+                select_custom_docker_target
+                return
+            elif (( choice == ${#services[@]} + 2 )); then
+                collect_native_database_config
+                return
+            elif (( choice == ${#services[@]} + 3 )); then
+                return 1
+            fi
+        fi
+        warning "Invalid selection."
+    done
+}
+
+select_docker_db_service() {
+    local services=()
+    local candidates=()
+    local service
+    local image
+
+    while IFS= read -r service; do
+        [[ -n "$service" ]] && services+=("$service")
+    done < <(get_all_compose_services || true)
+
+    for service in "${services[@]}"; do
+        image="$(compose_service_image "$service")"
+        if [[ -n "$image" ]] && image_matches_db_type "$image" "$BACKUP_DB_TYPE"; then
+            candidates+=("${service}|${image}")
+        fi
+    done
+
+    if [[ "${#candidates[@]}" -gt 0 ]]; then
+        echo
+        printf '%s-compatible image detected:\n' "$(db_engine_label "$BACKUP_DB_TYPE")"
+        echo
         local i
         for i in "${!candidates[@]}"; do
-            printf '%d. %s\n' "$((i + 1))" "${candidates[$i]%%|*}" >&2
+            printf '%d. %s\n' "$((i + 1))" "${candidates[$i]%%|*}"
+            printf '   Image: %s\n' "${candidates[$i]#*|}"
+            echo
         done
-        while true; do
-            if [[ -r /dev/tty ]]; then
-                read -r -p "Select [1-${#candidates[@]}]: " choice </dev/tty || return 1
-            else
-                read -r -p "Select [1-${#candidates[@]}]: " choice || return 1
-            fi
-            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#candidates[@]} )); then
-                BACKUP_DB_SERVICE="${candidates[$((choice - 1))]%%|*}"
-                BACKUP_DB_TYPE="${candidates[$((choice - 1))]#*|}"
-                [[ -n "$BACKUP_DB_TYPE" ]] || BACKUP_DB_TYPE="$(select_db_type)"
-                return 0
-            fi
-            warning "Invalid selection."
-        done
+        printf '%d. Select another available service\n' "$(( ${#candidates[@]} + 1 ))"
+        printf '%d. Enter service/container manually\n' "$(( ${#candidates[@]} + 2 ))"
+        printf '%d. Use native/external database\n' "$(( ${#candidates[@]} + 3 ))"
+        printf '%d. Cancel\n' "$(( ${#candidates[@]} + 4 ))"
+        select_docker_image_candidate "${candidates[@]}" || {
+            info "Database backup cancelled."
+            return 1
+        }
+    else
+        warning "No $(db_engine_label "$BACKUP_DB_TYPE")-compatible service image was detected."
+        local action
+        action="$(
+            select_option \
+                "Database execution target:" \
+                "Select from available Compose services" \
+                "Enter service/container manually" \
+                "Use native/external database" \
+                "Cancel"
+        )" || return 1
+        case "$action" in
+            "Select from available Compose services") select_available_compose_service_target ;;
+            "Enter service/container manually") select_custom_docker_target ;;
+            "Use native/external database") collect_native_database_config; return ;;
+            "Cancel") info "Database backup cancelled."; return 1 ;;
+        esac
     fi
 
-    warning "No PostgreSQL/MySQL/MariaDB service was detected in this Compose stack."
-    echo
-    local location
-    location="$(
-        select_option \
-            "Database location:" \
-            "Database runs inside another Compose service" \
-            "Database is external/native" \
-            "Enter container/service manually" \
-            "Cancel"
-    )" || return 1
+    [[ "$BACKUP_SOURCE_MODE" == "native" ]] && return 0
+    confirm_selected_docker_target
+}
 
-    case "$location" in
-        "Database runs inside another Compose service")
-            BACKUP_DB_SERVICE="$(select_compose_service)" || return 1
-            BACKUP_DB_TYPE="$(select_db_type)" || return 1
+docker_service_has_client() {
+    local service="${1:-$BACKUP_DB_SERVICE}"
+    local db_type="$2"
+
+    case "$db_type" in
+        postgresql|postgres)
+            docker_target_exec sh -c 'command -v pg_dump >/dev/null 2>&1'
             ;;
-        "Database is external/native")
-            collect_native_database_config
-            return
+        mysql)
+            docker_target_exec sh -c 'command -v mysqldump >/dev/null 2>&1'
             ;;
-        "Enter container/service manually")
-            BACKUP_DB_SERVICE="$(ask_required_input "Compose service/container")" || return 1
-            BACKUP_DB_TYPE="$(select_db_type)" || return 1
+        mariadb)
+            docker_target_exec sh -c 'command -v mariadb-dump >/dev/null 2>&1 || command -v mysqldump >/dev/null 2>&1'
             ;;
-        "Cancel")
-            return 1
+        mongodb)
+            docker_target_exec sh -c 'command -v mongodump >/dev/null 2>&1'
             ;;
     esac
 }
@@ -622,6 +871,111 @@ resolve_required_env_value() {
     done
 }
 
+default_db_port() {
+    case "$1" in
+        postgresql|postgres) printf '5432\n' ;;
+        mysql|mariadb) printf '3306\n' ;;
+        mongodb) printf '27017\n' ;;
+    esac
+}
+
+resolve_optional_env_value() {
+    local label="$1"
+    local var_name="$2"
+    local value_name_ref="$3"
+    local default_value="$4"
+    local value=""
+
+    if [[ -n "$BACKUP_ENV_FILE" && -n "$var_name" ]]; then
+        value="$(env_file_value "$BACKUP_ENV_FILE" "$var_name" || true)"
+    fi
+
+    if [[ -z "$value" ]]; then
+        value="$(ask_input "$label" "$default_value")" || return 1
+    else
+        printf '%s: %s\n' "$label" "$value" >&2
+    fi
+
+    printf -v "$value_name_ref" '%s' "$value"
+}
+
+collect_mongodb_connection_config() {
+    local mode
+
+    mode="$(
+        select_option \
+            "MongoDB connection:" \
+            "Connection URI" \
+            "Host/port/database/user/password"
+    )" || return 1
+
+    case "$mode" in
+        "Connection URI")
+            BACKUP_MONGO_URI_VAR="$(ask_input "MongoDB URI env var" "MONGO_URI")" || return 1
+            if [[ -n "$BACKUP_ENV_FILE" ]]; then
+                BACKUP_MONGO_URI="$(env_file_value "$BACKUP_ENV_FILE" "$BACKUP_MONGO_URI_VAR" || true)"
+            fi
+            if [[ -z "$BACKUP_MONGO_URI" ]]; then
+                warning "${BACKUP_MONGO_URI_VAR} was not found in:"
+                warning "${BACKUP_ENV_FILE:-no env file}"
+                BACKUP_MONGO_URI="$(read_secret "MongoDB URI")" || return 1
+                BACKUP_CREDENTIAL_SOURCE="prompt"
+            else
+                BACKUP_CREDENTIAL_SOURCE="env"
+            fi
+            BACKUP_DB_NAME="$(mongo_database_from_uri "$BACKUP_MONGO_URI")"
+            [[ -n "$BACKUP_DB_NAME" ]] || BACKUP_DB_NAME="$(ask_required_input "MongoDB database")" || return 1
+            ;;
+        "Host/port/database/user/password")
+            BACKUP_DB_HOST_VAR="$(ask_input "MongoDB host env var" "MONGO_HOST")" || return 1
+            BACKUP_DB_PORT_VAR="$(ask_input "MongoDB port env var" "MONGO_PORT")" || return 1
+            BACKUP_DB_NAME_VAR="$(ask_input "MongoDB database env var" "MONGO_DB")" || return 1
+            BACKUP_DB_USER_VAR="$(ask_input "MongoDB user env var" "MONGO_USER")" || return 1
+            BACKUP_DB_PASSWORD_VAR="$(ask_input "MongoDB password env var" "MONGO_PASSWORD")" || return 1
+            BACKUP_CREDENTIAL_SOURCE="env"
+            resolve_optional_env_value "MongoDB host" "$BACKUP_DB_HOST_VAR" BACKUP_DB_HOST "localhost" || return 1
+            resolve_optional_env_value "MongoDB port" "$BACKUP_DB_PORT_VAR" BACKUP_DB_PORT "27017" || return 1
+            resolve_required_env_value "MongoDB database" BACKUP_DB_NAME_VAR BACKUP_DB_NAME || return 1
+            resolve_required_env_value "MongoDB user" BACKUP_DB_USER_VAR BACKUP_DB_USER || return 1
+            resolve_password_env_value || return 1
+            ;;
+    esac
+}
+
+mongo_database_from_uri() {
+    local uri="$1"
+    local without_scheme
+    local path
+
+    without_scheme="${uri#*://}"
+    [[ "$without_scheme" != "$uri" ]] || return 0
+    [[ "$without_scheme" == */* ]] || return 0
+    path="${without_scheme#*/}"
+    path="${path%%\?*}"
+    [[ -n "$path" ]] && printf '%s\n' "$path"
+}
+
+mongo_connection_uri() {
+    local password
+
+    if [[ -n "$BACKUP_MONGO_URI" ]]; then
+        printf '%s\n' "$BACKUP_MONGO_URI"
+        return 0
+    fi
+
+    if [[ "$BACKUP_CREDENTIAL_SOURCE" == "env" && -n "$BACKUP_ENV_FILE" && -n "$BACKUP_MONGO_URI_VAR" ]]; then
+        BACKUP_MONGO_URI="$(env_file_value "$BACKUP_ENV_FILE" "$BACKUP_MONGO_URI_VAR" || true)"
+        [[ -n "$BACKUP_MONGO_URI" ]] && printf '%s\n' "$BACKUP_MONGO_URI" && return 0
+    fi
+
+    password="$(backup_password_env_prefix)"
+    if [[ -n "$BACKUP_DB_USER" && -n "$password" ]]; then
+        printf 'mongodb://%s:%s@%s:%s/%s\n' "$BACKUP_DB_USER" "$password" "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-27017}" "$BACKUP_DB_NAME"
+    else
+        printf 'mongodb://%s:%s/%s\n' "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-27017}" "$BACKUP_DB_NAME"
+    fi
+}
+
 resolve_password_env_value() {
     local default_var="$BACKUP_DB_PASSWORD_VAR"
     local action
@@ -674,20 +1028,25 @@ ensure_native_backup_client() {
     local missing_label
 
     case "$db_type" in
-        postgres)
-            command_exists pg_dump && return 0
+        postgresql|postgres)
+            command_exists pg_dump && command_exists psql && return 0
             package="postgresql-client"
-            missing_label="PostgreSQL backup client (pg_dump)"
+            missing_label="PostgreSQL client tools (pg_dump/psql)"
             ;;
         mysql)
-            command_exists mysqldump && return 0
+            command_exists mysqldump && command_exists mysql && return 0
             package="default-mysql-client"
-            missing_label="MySQL backup client (mysqldump)"
+            missing_label="MySQL client tools (mysqldump/mysql)"
             ;;
         mariadb)
-            { command_exists mariadb-dump || command_exists mysqldump; } && return 0
+            { command_exists mariadb-dump || command_exists mysqldump; } && { command_exists mariadb || command_exists mysql; } && return 0
             package="mariadb-client"
-            missing_label="MariaDB backup client (mariadb-dump or mysqldump)"
+            missing_label="MariaDB client tools (mariadb-dump/mariadb)"
+            ;;
+        mongodb)
+            command_exists mongodump && command_exists mongorestore && return 0
+            package="mongodb-database-tools"
+            missing_label="MongoDB database tools (mongodump/mongorestore)"
             ;;
     esac
 
@@ -704,9 +1063,10 @@ ensure_native_backup_client() {
     fi
 
     case "$db_type" in
-        postgres) command_exists pg_dump ;;
-        mysql) command_exists mysqldump ;;
-        mariadb) command_exists mariadb-dump || command_exists mysqldump ;;
+        postgresql|postgres) command_exists pg_dump && command_exists psql ;;
+        mysql) command_exists mysqldump && command_exists mysql ;;
+        mariadb) { command_exists mariadb-dump || command_exists mysqldump; } && { command_exists mariadb || command_exists mysql; } ;;
+        mongodb) command_exists mongodump && command_exists mongorestore ;;
     esac
 }
 
@@ -728,18 +1088,23 @@ preflight_docker_client() {
 
     action="$(
         select_option \
-            "Database execution:" \
+            "Backup execution:" \
             "Select another Compose service" \
-            "Configure native/external database" \
+            "Enter service/container manually" \
+            "Use host/native DB client" \
             "Cancel"
     )" || return 1
 
     case "$action" in
         "Select another Compose service")
-            BACKUP_DB_SERVICE="$(select_compose_service)" || return 1
+            select_available_compose_service_target || return 1
             preflight_docker_client "$db_type"
             ;;
-        "Configure native/external database")
+        "Enter service/container manually")
+            select_custom_docker_target || return 1
+            preflight_docker_client "$db_type"
+            ;;
+        "Use host/native DB client")
             collect_native_database_config
             ;;
         "Cancel")
@@ -752,14 +1117,24 @@ preflight_postgres() {
     local password
 
     if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
-        preflight_docker_client postgres || return 1
-        if compose_exec exec -T "$BACKUP_DB_SERVICE" sh -c 'command -v pg_isready >/dev/null 2>&1'; then
-            compose_exec exec -T "$BACKUP_DB_SERVICE" pg_isready >/dev/null 2>&1 || true
+        preflight_docker_client postgresql || return 1
+        password="$(backup_password_env_prefix)"
+        if docker_target_exec sh -c 'command -v psql >/dev/null 2>&1'; then
+            if [[ -n "$password" ]]; then
+                docker_target_exec env "PGPASSWORD=${password}" psql -h "${BACKUP_DB_HOST:-localhost}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null 2>&1
+            else
+                docker_target_exec psql -h "${BACKUP_DB_HOST:-localhost}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null 2>&1
+            fi || {
+                error "PostgreSQL connectivity test failed."
+                [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
+                preflight_failure_action
+                return
+            }
         fi
         return 0
     fi
 
-    ensure_native_backup_client postgres || return 1
+    ensure_native_backup_client postgresql || return 1
     info "Checking PostgreSQL connection..."
     if command_exists pg_isready && pg_isready -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" >/dev/null 2>&1; then
         success "PostgreSQL is reachable."
@@ -794,6 +1169,19 @@ preflight_mysql_like() {
 
     if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
         preflight_docker_client "$db_type" || return 1
+        password="$(backup_password_env_prefix)"
+        if docker_target_exec sh -c 'command -v mariadb >/dev/null 2>&1 || command -v mysql >/dev/null 2>&1'; then
+            if [[ -n "$password" ]]; then
+                docker_target_exec env "MYSQL_PWD=${password}" sh -c 'if command -v mariadb >/dev/null 2>&1; then exec mariadb -h "$1" -P "$2" -u "$3" "$4" -e "select 1"; else exec mysql -h "$1" -P "$2" -u "$3" "$4" -e "select 1"; fi' sh "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-3306}" "$BACKUP_DB_USER" "$BACKUP_DB_NAME" >/dev/null 2>&1
+            else
+                docker_target_exec sh -c 'if command -v mariadb >/dev/null 2>&1; then exec mariadb -h "$1" -P "$2" -u "$3" "$4" -e "select 1"; else exec mysql -h "$1" -P "$2" -u "$3" "$4" -e "select 1"; fi' sh "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-3306}" "$BACKUP_DB_USER" "$BACKUP_DB_NAME" >/dev/null 2>&1
+            fi || {
+                error "$(db_engine_label "$db_type") connectivity test failed."
+                [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
+                preflight_failure_action
+                return
+            }
+        fi
         return 0
     fi
 
@@ -827,6 +1215,57 @@ preflight_mysql() {
 
 preflight_mariadb() {
     preflight_mysql_like mariadb
+}
+
+preflight_mongodb() {
+    local uri
+
+    if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
+        preflight_docker_client mongodb || return 1
+        if docker_target_exec sh -c 'command -v mongosh >/dev/null 2>&1 || command -v mongo >/dev/null 2>&1'; then
+            uri="$(mongo_connection_uri)"
+            docker_target_exec sh -c 'if command -v mongosh >/dev/null 2>&1; then mongosh "$1" --quiet --eval "db.runCommand({ ping: 1 }).ok"; else mongo "$1" --quiet --eval "db.runCommand({ ping: 1 }).ok"; fi' sh "$uri" >/dev/null 2>&1 || {
+                error "MongoDB connectivity test failed."
+                [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
+                preflight_failure_action
+                return
+            }
+        else
+            uri="$(mongo_connection_uri)"
+            docker_target_exec mongodump --uri="$uri" --db "$BACKUP_DB_NAME" --collection "__hostctl_preflight_nonexistent__" --archive --gzip >/dev/null 2>&1 || {
+                error "MongoDB connectivity test failed."
+                [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
+                preflight_failure_action
+                return
+            }
+        fi
+        return 0
+    fi
+
+    ensure_native_backup_client mongodb || return 1
+    uri="$(mongo_connection_uri)"
+    if command_exists mongosh; then
+        mongosh "$uri" --quiet --eval 'db.runCommand({ ping: 1 }).ok' >/dev/null 2>&1 || {
+            error "MongoDB connectivity test failed."
+            [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
+            preflight_failure_action
+            return
+        }
+    elif command_exists mongo; then
+        mongo "$uri" --quiet --eval 'db.runCommand({ ping: 1 }).ok' >/dev/null 2>&1 || {
+            error "MongoDB connectivity test failed."
+            [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
+            preflight_failure_action
+            return
+        }
+    else
+        mongodump --uri="$uri" --db "$BACKUP_DB_NAME" --collection "__hostctl_preflight_nonexistent__" --archive=/dev/null --gzip >/dev/null 2>&1 || {
+            error "MongoDB connectivity test failed."
+            [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
+            preflight_failure_action
+            return
+        }
+    fi
 }
 
 preflight_failure_action() {
@@ -864,15 +1303,33 @@ show_preflight_summary() {
     printf 'Source: %s\n' "$BACKUP_SOURCE_MODE"
     printf 'Engine: %s\n' "$(db_engine_label "$BACKUP_DB_TYPE")"
     if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
-        printf 'Execution service: %s\n' "$BACKUP_DB_SERVICE"
+        echo "Executor:"
+        if [[ "${BACKUP_DOCKER_TARGET_TYPE:-service}" == "container" ]]; then
+            printf 'Container: %s\n' "$BACKUP_DOCKER_CONTAINER"
+        else
+            printf 'Service: %s\n' "$BACKUP_DB_SERVICE"
+        fi
+        printf 'Image: %s\n' "${BACKUP_DOCKER_IMAGE:-not declared}"
+    else
+        echo "Executor:"
+        printf 'Host OS client\n'
+    fi
+    echo
+    echo "Target:"
+    if [[ "$BACKUP_DB_TYPE" == "mongodb" && -n "$BACKUP_MONGO_URI" ]]; then
+        printf 'MongoDB URI: configured\n'
     else
         printf 'Host: %s\n' "$BACKUP_DB_HOST"
         printf 'Port: %s\n' "$BACKUP_DB_PORT"
+        printf 'Database: %s\n' "$BACKUP_DB_NAME"
+        printf 'User: %s\n' "$BACKUP_DB_USER"
     fi
-    printf 'Database: %s\n' "$BACKUP_DB_NAME"
-    printf 'User: %s\n' "$BACKUP_DB_USER"
-    printf 'Backup client: %s available\n' "$(backup_client_name "$BACKUP_DB_TYPE")"
-    printf 'Connection: reachable or deferred\n'
+    echo
+    echo "Backup client:"
+    printf '%s available\n' "$(backup_client_name "$BACKUP_DB_TYPE")"
+    echo
+    echo "Connectivity:"
+    printf 'successful\n'
     echo
     success "Database is ready for backup."
 }
@@ -881,9 +1338,10 @@ preflight_database_config() {
     backup_resolve_runtime_values || return 1
 
     case "$BACKUP_DB_TYPE" in
-        postgres) preflight_postgres || return 1 ;;
+        postgresql|postgres) preflight_postgres || return 1 ;;
         mysql) preflight_mysql || return 1 ;;
         mariadb) preflight_mariadb || return 1 ;;
+        mongodb) preflight_mongodb || return 1 ;;
     esac
 
     show_preflight_summary
@@ -898,13 +1356,43 @@ collect_docker_database_config() {
     BACKUP_COMPOSE_FILE="$COMPOSE_FILE"
     BACKUP_ENV_FILE="${ENV_FILE:-}"
 
+    BACKUP_DB_TYPE="$(select_db_type)" || return 1
     select_docker_db_service || return 1
+    [[ "$BACKUP_SOURCE_MODE" == "native" ]] && return 0
 
-    BACKUP_DB_NAME_VAR="$(ask_input "Database name env var" "DB_NAME")" || return 1
-    BACKUP_DB_USER_VAR="$(ask_input "Database user env var" "DB_USER")" || return 1
-    BACKUP_DB_PASSWORD_VAR="$(ask_input "Database password env var" "DB_PASSWORD")" || return 1
+    case "$BACKUP_DB_TYPE" in
+        postgresql)
+            BACKUP_DB_HOST_VAR="$(ask_input "Database host env var" "DB_HOST")" || return 1
+            BACKUP_DB_PORT_VAR="$(ask_input "Database port env var" "DB_PORT")" || return 1
+            BACKUP_DB_NAME_VAR="$(ask_input "Database name env var" "DB_NAME")" || return 1
+            BACKUP_DB_USER_VAR="$(ask_input "Database user env var" "DB_USER")" || return 1
+            BACKUP_DB_PASSWORD_VAR="$(ask_input "Database password env var" "DB_PASSWORD")" || return 1
+            ;;
+        mysql)
+            BACKUP_DB_HOST_VAR="$(ask_input "Database host env var" "MYSQL_HOST")" || return 1
+            BACKUP_DB_PORT_VAR="$(ask_input "Database port env var" "MYSQL_PORT")" || return 1
+            BACKUP_DB_NAME_VAR="$(ask_input "Database name env var" "MYSQL_DATABASE")" || return 1
+            BACKUP_DB_USER_VAR="$(ask_input "Database user env var" "MYSQL_USER")" || return 1
+            BACKUP_DB_PASSWORD_VAR="$(ask_input "Database password env var" "MYSQL_PASSWORD")" || return 1
+            ;;
+        mariadb)
+            BACKUP_DB_HOST_VAR="$(ask_input "Database host env var" "MARIADB_HOST")" || return 1
+            BACKUP_DB_PORT_VAR="$(ask_input "Database port env var" "MARIADB_PORT")" || return 1
+            BACKUP_DB_NAME_VAR="$(ask_input "Database name env var" "MARIADB_DATABASE")" || return 1
+            BACKUP_DB_USER_VAR="$(ask_input "Database user env var" "MARIADB_USER")" || return 1
+            BACKUP_DB_PASSWORD_VAR="$(ask_input "Database password env var" "MARIADB_PASSWORD")" || return 1
+            ;;
+        mongodb)
+            collect_mongodb_connection_config
+            preflight_database_config || return 1
+            return 0
+            ;;
+    esac
+
     BACKUP_CREDENTIAL_SOURCE="env"
 
+    resolve_optional_env_value "Database host" "$BACKUP_DB_HOST_VAR" BACKUP_DB_HOST "${BACKUP_DB_SERVICE:-localhost}" || return 1
+    resolve_optional_env_value "Database port" "$BACKUP_DB_PORT_VAR" BACKUP_DB_PORT "$(default_db_port "$BACKUP_DB_TYPE")" || return 1
     resolve_required_env_value "Database" BACKUP_DB_NAME_VAR BACKUP_DB_NAME || return 1
     resolve_required_env_value "Database user" BACKUP_DB_USER_VAR BACKUP_DB_USER || return 1
     resolve_password_env_value || return 1
@@ -913,8 +1401,9 @@ collect_docker_database_config() {
 }
 
 detect_native_db_types() {
-    command_exists pg_dump && printf 'postgres\n'
+    command_exists pg_dump && printf 'postgresql\n'
     { command_exists mysqldump || command_exists mariadb-dump; } && printf 'mysql\n'
+    command_exists mongodump && printf 'mongodb\n'
 }
 
 collect_native_database_config() {
@@ -936,8 +1425,28 @@ collect_native_database_config() {
         BACKUP_DB_TYPE="$(select_db_type)"
     fi
 
+    ensure_native_backup_client "$BACKUP_DB_TYPE" || {
+        local native_action
+        native_action="$(
+            select_option \
+                "$(db_engine_label "$BACKUP_DB_TYPE") client tools:" \
+                "Choose another DB type" \
+                "Cancel"
+        )" || return 1
+        case "$native_action" in
+            "Choose another DB type") collect_native_database_config; return ;;
+            "Cancel") info "Database backup cancelled."; return 1 ;;
+        esac
+    }
+
+    if [[ "$BACKUP_DB_TYPE" == "mongodb" ]]; then
+        collect_mongodb_connection_config
+        preflight_database_config || return 1
+        return
+    fi
+
     case "$BACKUP_DB_TYPE" in
-        postgres) BACKUP_DB_PORT="$(ask_input "Port" "5432")" ;;
+        postgresql|postgres) BACKUP_DB_PORT="$(ask_input "Port" "5432")" ;;
         mysql|mariadb) BACKUP_DB_PORT="$(ask_input "Port" "3306")" ;;
     esac
     BACKUP_DB_HOST="$(ask_input "Host" "127.0.0.1")" || return 1
@@ -1163,6 +1672,8 @@ collect_backup_config() {
 # ---------------------------------------------------------
 
 backup_resolve_runtime_values() {
+    [[ "$BACKUP_DB_TYPE" == "postgres" ]] && BACKUP_DB_TYPE="postgresql"
+
     if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
         COMPOSE_FILE="$BACKUP_COMPOSE_FILE"
         ENV_FILE="$BACKUP_ENV_FILE"
@@ -1184,6 +1695,13 @@ backup_resolve_runtime_values() {
         fi
     fi
 
+    if [[ "$BACKUP_DB_TYPE" == "mongodb" && -z "$BACKUP_MONGO_URI" && -n "$BACKUP_MONGO_URI_VAR" && -n "$BACKUP_ENV_FILE" ]]; then
+        BACKUP_MONGO_URI="$(env_file_value "$BACKUP_ENV_FILE" "$BACKUP_MONGO_URI_VAR" || true)"
+    fi
+    if [[ "$BACKUP_DB_TYPE" == "mongodb" && -n "$BACKUP_MONGO_URI" && -z "$BACKUP_DB_NAME" ]]; then
+        BACKUP_DB_NAME="$(mongo_database_from_uri "$BACKUP_MONGO_URI")"
+    fi
+
     if [[ -z "$BACKUP_DB_NAME" && -n "$BACKUP_DB_NAME_VAR" && -n "$BACKUP_ENV_FILE" ]]; then
         BACKUP_DB_NAME="$(env_file_value "$BACKUP_ENV_FILE" "$BACKUP_DB_NAME_VAR" || true)"
     fi
@@ -1192,12 +1710,20 @@ backup_resolve_runtime_values() {
     fi
 
     [[ -n "$BACKUP_DB_NAME" ]] || { error "Database name is missing."; return 1; }
-    [[ -n "$BACKUP_DB_USER" ]] || { error "Database user is missing."; return 1; }
+    if [[ "$BACKUP_DB_TYPE" != "mongodb" || -z "$BACKUP_MONGO_URI" ]]; then
+        [[ -n "$BACKUP_DB_USER" ]] || { error "Database user is missing."; return 1; }
+    fi
 
     if [[ "$BACKUP_CREDENTIAL_SOURCE" == "env" ]]; then
         if [[ -z "$BACKUP_ENV_FILE" || ! -f "$BACKUP_ENV_FILE" ]]; then
             error "Configured environment file is missing: ${BACKUP_ENV_FILE:-none}"
             return 1
+        fi
+        if [[ "$BACKUP_DB_TYPE" == "mongodb" && -n "$BACKUP_MONGO_URI_VAR" ]]; then
+            if ! env_file_value "$BACKUP_ENV_FILE" "$BACKUP_MONGO_URI_VAR" >/dev/null 2>&1; then
+                error "MongoDB URI variable not found in environment file: ${BACKUP_MONGO_URI_VAR}"
+                return 1
+            fi
         fi
         if [[ -n "$BACKUP_DB_PASSWORD_VAR" ]] &&
            ! env_file_value "$BACKUP_ENV_FILE" "$BACKUP_DB_PASSWORD_VAR" >/dev/null 2>&1; then
@@ -1252,22 +1778,47 @@ run_dump_command_to_file() {
     return 0
 }
 
+run_command_capture_stderr() {
+    local failure_label="$1"
+    shift
+    local error_file
+    local rc
+
+    error_file="$(mktemp)"
+    set +e
+    "$@" 2>"$error_file"
+    rc=$?
+    set -e
+
+    if [[ "$rc" -ne 0 ]]; then
+        [[ -s "$error_file" ]] && cat "$error_file" >&2
+        error "$failure_label failed."
+        info "No valid backup file was created."
+        BACKUP_LAST_ERROR="$failure_label failed"
+        rm -f "$error_file"
+        return "$rc"
+    fi
+
+    rm -f "$error_file"
+    return 0
+}
+
 docker_dump_database_to_sql() {
     local sql_file="$1"
     local password
 
     case "$BACKUP_DB_TYPE" in
-        postgres)
+        postgresql|postgres)
             info "Creating PostgreSQL dump..."
             password="$(backup_password_env_prefix)"
             if [[ -n "$password" ]]; then
                 run_dump_command_to_file "PostgreSQL backup" "$sql_file" \
-                    compose_exec exec -T -e "PGPASSWORD=${password}" "$BACKUP_DB_SERVICE" \
-                    pg_dump -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
+                    docker_target_exec env "PGPASSWORD=${password}" \
+                    pg_dump -h "${BACKUP_DB_HOST:-localhost}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             else
                 run_dump_command_to_file "PostgreSQL backup" "$sql_file" \
-                    compose_exec exec -T "$BACKUP_DB_SERVICE" \
-                    pg_dump -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
+                    docker_target_exec \
+                    pg_dump -h "${BACKUP_DB_HOST:-localhost}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             fi
             ;;
         mysql|mariadb)
@@ -1275,13 +1826,18 @@ docker_dump_database_to_sql() {
             password="$(backup_password_env_prefix)"
             if [[ -n "$password" ]]; then
                 run_dump_command_to_file "MySQL/MariaDB backup" "$sql_file" \
-                    compose_exec exec -T -e "MYSQL_PWD=${password}" "$BACKUP_DB_SERVICE" \
-                    sh -c "command -v mariadb-dump >/dev/null 2>&1 && exec mariadb-dump --no-tablespaces -u \"\$1\" \"\$2\" || exec mysqldump --no-tablespaces -u \"\$1\" \"\$2\"" sh "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
+                    docker_target_exec env "MYSQL_PWD=${password}" \
+                    sh -c "command -v mariadb-dump >/dev/null 2>&1 && exec mariadb-dump --no-tablespaces -h \"\$1\" -P \"\$2\" -u \"\$3\" \"\$4\" || exec mysqldump --no-tablespaces -h \"\$1\" -P \"\$2\" -u \"\$3\" \"\$4\"" sh "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-3306}" "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             else
                 run_dump_command_to_file "MySQL/MariaDB backup" "$sql_file" \
-                    compose_exec exec -T "$BACKUP_DB_SERVICE" \
-                    sh -c "command -v mariadb-dump >/dev/null 2>&1 && exec mariadb-dump --no-tablespaces -u \"\$1\" \"\$2\" || exec mysqldump --no-tablespaces -u \"\$1\" \"\$2\"" sh "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
+                    docker_target_exec \
+                    sh -c "command -v mariadb-dump >/dev/null 2>&1 && exec mariadb-dump --no-tablespaces -h \"\$1\" -P \"\$2\" -u \"\$3\" \"\$4\" || exec mysqldump --no-tablespaces -h \"\$1\" -P \"\$2\" -u \"\$3\" \"\$4\"" sh "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-3306}" "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             fi
+            ;;
+        mongodb)
+            info "Creating MongoDB dump..."
+            run_dump_command_to_file "MongoDB backup" "$sql_file" \
+                docker_target_exec mongodump --uri="$(mongo_connection_uri)" --archive --gzip
             ;;
     esac
 }
@@ -1292,7 +1848,7 @@ native_dump_database_to_sql() {
     local dump_cmd
 
     case "$BACKUP_DB_TYPE" in
-        postgres)
+        postgresql|postgres)
             command_exists pg_dump || { error "pg_dump not found."; return 1; }
             info "Creating PostgreSQL dump..."
             password="$(backup_password_env_prefix)"
@@ -1323,6 +1879,12 @@ native_dump_database_to_sql() {
                     "$dump_cmd" --no-tablespaces -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             fi
             ;;
+        mongodb)
+            command_exists mongodump || { error "mongodump not found."; return 1; }
+            info "Creating MongoDB dump..."
+            run_command_capture_stderr "MongoDB backup" \
+                mongodump --uri="$(mongo_connection_uri)" --archive="$sql_file" --gzip
+            ;;
     esac
 }
 
@@ -1345,6 +1907,14 @@ validate_backup_file() {
         return 1
     }
 
+    if [[ "$BACKUP_DB_TYPE" == "mongodb" ]]; then
+        gzip -t "$file" || {
+            error "MongoDB archive gzip integrity check failed: ${file}"
+            return 1
+        }
+        return 0
+    fi
+
     gzip -t "$file" || {
         error "Backup gzip integrity check failed: ${file}"
         return 1
@@ -1360,6 +1930,23 @@ create_database_dump() {
     local output_file="$1"
     local tmp_sql
     local tmp_gz
+
+    if [[ "$BACKUP_DB_TYPE" == "mongodb" ]]; then
+        tmp_gz="${output_file}.tmp"
+        rm -f "$tmp_gz"
+        if ! dump_database_to_sql "$tmp_gz"; then
+            rm -f "$tmp_gz"
+            return 1
+        fi
+        validate_backup_file "$tmp_gz" || {
+            rm -f "$tmp_gz"
+            return 1
+        }
+        mv "$tmp_gz" "$output_file"
+        success "Database dump created."
+        success "Backup integrity verified."
+        return 0
+    fi
 
     tmp_sql="${output_file}.sql.tmp"
     tmp_gz="${output_file}.tmp"
@@ -1398,7 +1985,11 @@ backup_filename() {
 
     db="$(sanitize_backup_name "${BACKUP_DB_NAME:-database}")"
     [[ -n "$prefix" ]] && db="${prefix}_${db}"
-    printf '%s_%s.sql.gz\n' "$db" "$(date '+%Y%m%d_%H%M%S')"
+    if [[ "$BACKUP_DB_TYPE" == "mongodb" ]]; then
+        printf '%s_%s.archive.gz\n' "$db" "$(date '+%Y%m%d_%H%M%S')"
+    else
+        printf '%s_%s.sql.gz\n' "$db" "$(date '+%Y%m%d_%H%M%S')"
+    fi
 }
 
 rclone_remote_target() {
@@ -1427,7 +2018,7 @@ apply_local_retention() {
             ;;
     esac
 
-    find "$path" -maxdepth 1 -type f -name '*.sql.gz' -mtime "+${days}" -print |
+    find "$path" -maxdepth 1 -type f \( -name '*.sql.gz' -o -name '*.archive.gz' \) -mtime "+${days}" -print |
         while IFS= read -r old_file; do
             rm -f "$old_file"
         done
@@ -2106,7 +2697,7 @@ select_backup_file_from_dir() {
 
     while IFS= read -r file; do
         [[ -f "$file" ]] && files+=("$file")
-    done < <(find "$dir" -maxdepth 1 -type f \( -name '*.sql' -o -name '*.sql.gz' \) -print | sort)
+    done < <(find "$dir" -maxdepth 1 -type f \( -name '*.sql' -o -name '*.sql.gz' -o -name '*.archive.gz' \) -print | sort)
 
     [[ "${#files[@]}" -gt 0 ]] || {
         error "No backup files found in: ${dir}"
@@ -2139,7 +2730,8 @@ validate_restore_file() {
     case "$file" in
         *.sql) return 0 ;;
         *.sql.gz) gzip -t "$file" ;;
-        *) error "Unsupported backup format. Use .sql or .sql.gz."; return 1 ;;
+        *.archive.gz) gzip -t "$file" ;;
+        *) error "Unsupported backup format. Use .sql, .sql.gz, or .archive.gz."; return 1 ;;
     esac
 }
 
@@ -2161,7 +2753,7 @@ download_remote_restore_file() {
 
     while IFS= read -r file; do
         [[ -n "$file" ]] && files+=("$file")
-    done < <(rclone lsf "$remote_base" --files-only 2>/dev/null | awk '/\.sql(\.gz)?$/')
+    done < <(rclone lsf "$remote_base" --files-only 2>/dev/null | awk '/(\.sql(\.gz)?|\.archive\.gz)$/')
 
     [[ "${#files[@]}" -gt 0 ]] || { error "No remote backup files found."; return 1; }
     echo "Remote backup files:" >&2
@@ -2198,40 +2790,48 @@ restore_database_from_file() {
 
     if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
         case "$BACKUP_DB_TYPE" in
-            postgres)
+            postgresql|postgres)
                 if [[ "$file" == *.gz ]]; then
                     if [[ -n "$password" ]]; then
-                        gzip -dc "$file" | compose_exec exec -T -e "PGPASSWORD=${password}" "$BACKUP_DB_SERVICE" psql -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
+                        gzip -dc "$file" | docker_target_exec_input env "PGPASSWORD=${password}" psql -h "${BACKUP_DB_HOST:-localhost}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
                     else
-                        gzip -dc "$file" | compose_exec exec -T "$BACKUP_DB_SERVICE" psql -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
+                        gzip -dc "$file" | docker_target_exec_input psql -h "${BACKUP_DB_HOST:-localhost}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
                     fi
                 else
                     if [[ -n "$password" ]]; then
-                        compose_exec exec -T -e "PGPASSWORD=${password}" "$BACKUP_DB_SERVICE" psql -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
+                        docker_target_exec_input env "PGPASSWORD=${password}" psql -h "${BACKUP_DB_HOST:-localhost}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" < "$file"
                     else
-                        compose_exec exec -T "$BACKUP_DB_SERVICE" psql -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
+                        docker_target_exec_input psql -h "${BACKUP_DB_HOST:-localhost}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" < "$file"
                     fi
                 fi
                 ;;
             mysql|mariadb)
                 if [[ "$file" == *.gz ]]; then
                     if [[ -n "$password" ]]; then
-                        gzip -dc "$file" | compose_exec exec -T -e "MYSQL_PWD=${password}" "$BACKUP_DB_SERVICE" sh -c "command -v mariadb >/dev/null 2>&1 && exec mariadb -u \"\$1\" \"\$2\" || exec mysql -u \"\$1\" \"\$2\"" sh "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
+                        gzip -dc "$file" | docker_target_exec_input env "MYSQL_PWD=${password}" sh -c 'command -v mariadb >/dev/null 2>&1 && exec mariadb -h "$1" -P "$2" -u "$3" "$4" || exec mysql -h "$1" -P "$2" -u "$3" "$4"' sh "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-3306}" "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
                     else
-                        gzip -dc "$file" | compose_exec exec -T "$BACKUP_DB_SERVICE" sh -c "command -v mariadb >/dev/null 2>&1 && exec mariadb -u \"\$1\" \"\$2\" || exec mysql -u \"\$1\" \"\$2\"" sh "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
+                        gzip -dc "$file" | docker_target_exec_input sh -c 'command -v mariadb >/dev/null 2>&1 && exec mariadb -h "$1" -P "$2" -u "$3" "$4" || exec mysql -h "$1" -P "$2" -u "$3" "$4"' sh "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-3306}" "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
                     fi
                 else
                     if [[ -n "$password" ]]; then
-                        compose_exec exec -T -e "MYSQL_PWD=${password}" "$BACKUP_DB_SERVICE" sh -c "command -v mariadb >/dev/null 2>&1 && exec mariadb -u \"\$1\" \"\$2\" || exec mysql -u \"\$1\" \"\$2\"" sh "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
+                        docker_target_exec_input env "MYSQL_PWD=${password}" sh -c 'command -v mariadb >/dev/null 2>&1 && exec mariadb -h "$1" -P "$2" -u "$3" "$4" || exec mysql -h "$1" -P "$2" -u "$3" "$4"' sh "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-3306}" "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
                     else
-                        compose_exec exec -T "$BACKUP_DB_SERVICE" sh -c "command -v mariadb >/dev/null 2>&1 && exec mariadb -u \"\$1\" \"\$2\" || exec mysql -u \"\$1\" \"\$2\"" sh "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
+                        docker_target_exec_input sh -c 'command -v mariadb >/dev/null 2>&1 && exec mariadb -h "$1" -P "$2" -u "$3" "$4" || exec mysql -h "$1" -P "$2" -u "$3" "$4"' sh "${BACKUP_DB_HOST:-localhost}" "${BACKUP_DB_PORT:-3306}" "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
                     fi
                 fi
+                ;;
+            mongodb)
+                [[ "$file" == *.archive.gz ]] || { error "MongoDB restore requires a .archive.gz backup."; return 1; }
+                docker_target_exec sh -c 'command -v mongorestore >/dev/null 2>&1' || {
+                    error "mongorestore not found in selected Docker target."
+                    return 1
+                }
+                docker_target_exec_input mongorestore --uri="$(mongo_connection_uri)" --archive --gzip < "$file"
                 ;;
         esac
     else
         case "$BACKUP_DB_TYPE" in
-            postgres)
+            postgresql|postgres)
                 if [[ "$file" == *.gz ]]; then
                     if [[ -n "$password" ]]; then
                         gzip -dc "$file" | PGPASSWORD="$password" psql -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
@@ -2262,6 +2862,11 @@ restore_database_from_file() {
                         "$mysql_cmd" -h "$BACKUP_DB_HOST" -P "$BACKUP_DB_PORT" -u "$BACKUP_DB_USER" "$BACKUP_DB_NAME" < "$file"
                     fi
                 fi
+                ;;
+            mongodb)
+                [[ "$file" == *.archive.gz ]] || { error "MongoDB restore requires a .archive.gz backup."; return 1; }
+                command_exists mongorestore || { error "mongorestore not found."; return 1; }
+                mongorestore --uri="$(mongo_connection_uri)" --archive="$file" --gzip
                 ;;
         esac
     fi
