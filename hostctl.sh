@@ -17,6 +17,7 @@ NGINX_LIB="${SCRIPT_DIR}/lib/nginx.sh"
 SSL_LIB="${SCRIPT_DIR}/lib/ssl.sh"
 FIREWALL_LIB="${SCRIPT_DIR}/lib/firewall.sh"
 BACKUP_LIB="${SCRIPT_DIR}/lib/backup.sh"
+DB_DIAGNOSTICS_LIB="${SCRIPT_DIR}/lib/db_diagnostics.sh"
 RCLONE_LIB="${SCRIPT_DIR}/lib/rclone.sh"
 
 # ---------------------------------------------------------
@@ -79,6 +80,13 @@ fi
 
 # shellcheck source=lib/backup.sh
 source "$BACKUP_LIB"
+
+if [[ ! -f "$DB_DIAGNOSTICS_LIB" ]]; then
+    die "Missing required library: $DB_DIAGNOSTICS_LIB"
+fi
+
+# shellcheck source=lib/db_diagnostics.sh
+source "$DB_DIAGNOSTICS_LIB"
 
 if [[ ! -f "$RCLONE_LIB" ]]; then
     die "Missing required library: $RCLONE_LIB"
