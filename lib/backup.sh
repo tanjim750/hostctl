@@ -941,9 +941,31 @@ docker_target_exec() {
     docker exec "$BACKUP_RUNTIME_CONTAINER" "$@"
 }
 
+docker_target_exec_env() {
+    local env_args=()
+
+    [[ -n "${BACKUP_RUNTIME_CONTAINER:-}" ]] || resolve_backup_executor_runtime || return 1
+    while [[ $# -gt 0 && "$1" == *=* ]]; do
+        env_args+=("-e" "$1")
+        shift
+    done
+    docker exec "${env_args[@]}" "$BACKUP_RUNTIME_CONTAINER" "$@"
+}
+
 docker_target_exec_input() {
     [[ -n "${BACKUP_RUNTIME_CONTAINER:-}" ]] || resolve_backup_executor_runtime || return 1
     docker exec -i "$BACKUP_RUNTIME_CONTAINER" "$@"
+}
+
+docker_target_exec_input_env() {
+    local env_args=()
+
+    [[ -n "${BACKUP_RUNTIME_CONTAINER:-}" ]] || resolve_backup_executor_runtime || return 1
+    while [[ $# -gt 0 && "$1" == *=* ]]; do
+        env_args+=("-e" "$1")
+        shift
+    done
+    docker exec -i "${env_args[@]}" "$BACKUP_RUNTIME_CONTAINER" "$@"
 }
 
 docker_target_image() {
@@ -1226,6 +1248,105 @@ docker_mysql_dump_command_name() {
     else
         printf 'mysqldump\n'
     fi
+}
+
+docker_postgres_connection_mode() {
+    local image
+    local host="${BACKUP_DB_HOST:-}"
+    local container_name
+
+    resolve_backup_executor_runtime || return 1
+    container_name="$(container_name_for_display "$BACKUP_RUNTIME_CONTAINER")"
+    image="$(container_image_for_display "$BACKUP_RUNTIME_CONTAINER")"
+    if image_matches_db_type "$image" postgresql ||
+       [[ -n "$host" && ( "$host" == "$BACKUP_DB_SERVICE" || "$host" == "$BACKUP_DOCKER_CONTAINER" || "$host" == "$container_name" ) ]]; then
+        printf 'local-container\n'
+    else
+        printf 'tcp\n'
+    fi
+}
+
+docker_postgres_base_connection_args() {
+    local mode="$1"
+
+    if [[ "$mode" == "local-container" ]]; then
+        printf '%s\0' -w -U "$BACKUP_DB_USER"
+    else
+        printf '%s\0' -w -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER"
+    fi
+}
+
+docker_postgres_exec_noninteractive() {
+    local password="$1"
+    shift
+
+    docker_target_exec_env \
+        "PGPASSWORD=${password}" \
+        "PGCONNECT_TIMEOUT=10" \
+        "PGPASSFILE=/dev/null" \
+        "$@"
+}
+
+docker_postgres_exec_input_noninteractive() {
+    local password="$1"
+    shift
+
+    docker_target_exec_input_env \
+        "PGPASSWORD=${password}" \
+        "PGCONNECT_TIMEOUT=10" \
+        "PGPASSFILE=/dev/null" \
+        "$@"
+}
+
+test_docker_postgres_backup_connection() {
+    local password
+    local mode
+    local args=()
+
+    password="$(backup_password_env_prefix)"
+    mode="$(docker_postgres_connection_mode)" || return 1
+    while IFS= read -r -d '' arg; do
+        args+=("$arg")
+    done < <(docker_postgres_base_connection_args "$mode")
+
+    info "Testing backup connection..."
+    if timeout_command "$BACKUP_COMMAND_TIMEOUT" docker_postgres_exec_noninteractive "$password" psql "${args[@]}" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null; then
+        success "Backup connection verified."
+        return 0
+    fi
+
+    error "PostgreSQL backup connection failed."
+    return 1
+}
+
+dump_docker_postgres_to_file() {
+    local output_file="$1"
+    local password
+    local mode
+    local args=()
+
+    password="$(backup_password_env_prefix)"
+    mode="$(docker_postgres_connection_mode)" || return 1
+    while IFS= read -r -d '' arg; do
+        args+=("$arg")
+    done < <(docker_postgres_base_connection_args "$mode")
+
+    info "Testing backup connection..."
+    if ! timeout_command "$BACKUP_COMMAND_TIMEOUT" docker_postgres_exec_noninteractive "$password" psql "${args[@]}" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null; then
+        error "PostgreSQL backup connection failed."
+        return 1
+    fi
+    success "Backup connection verified."
+
+    info "Executor: Docker container $(container_name_for_display "$BACKUP_RUNTIME_CONTAINER")"
+    info "DB engine: PostgreSQL"
+    info "Connection mode: ${mode}"
+    info "Database: ${BACKUP_DB_NAME}"
+    info "User: ${BACKUP_DB_USER}"
+    info "Command timeout: ${BACKUP_COMMAND_TIMEOUT}s"
+    info "Starting pg_dump..."
+    run_dump_command_to_file "$(backup_operation_label "PostgreSQL")" "$output_file" \
+        docker_postgres_exec_noninteractive "$password" pg_dump "${args[@]}" "$BACKUP_DB_NAME"
 }
 
 resolve_required_env_value() {
@@ -1627,16 +1748,11 @@ preflight_postgres() {
 
     if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
         preflight_docker_client postgresql || return 1
-        password="$(backup_password_env_prefix)"
         docker_target_has_executable psql || {
             error "psql is required in the selected executor for PostgreSQL connectivity validation."
             return 1
         }
-        if [[ -n "$password" ]]; then
-            docker_target_exec env "PGPASSWORD=${password}" psql -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null
-        else
-            docker_target_exec psql -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null
-        fi || {
+        test_docker_postgres_backup_connection || {
             error "PostgreSQL connectivity test failed."
             [[ "$BACKUP_CRON_MODE" -eq 1 ]] && return 1
             preflight_failure_action
@@ -1655,12 +1771,12 @@ preflight_postgres() {
     password="$(backup_password_env_prefix)"
     if command_exists psql; then
         if [[ -n "$password" ]]; then
-            PGPASSWORD="$password" psql -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null && {
+            PGPASSWORD="$password" PGPASSFILE=/dev/null psql -w -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null && {
                 success "PostgreSQL is reachable."
                 return 0
             }
         else
-            psql -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null && {
+            PGPASSFILE=/dev/null psql -w -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" -c 'select 1' >/dev/null && {
                 success "PostgreSQL is reachable."
                 return 0
             }
@@ -2252,8 +2368,10 @@ timeout_command() {
 
     while kill -0 "$pid" 2>/dev/null; do
         if (( elapsed >= timeout_seconds )); then
+            pkill -TERM -P "$pid" 2>/dev/null || true
             kill -TERM "$pid" 2>/dev/null || true
             sleep 2
+            pkill -KILL -P "$pid" 2>/dev/null || true
             kill -KILL "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
             BACKUP_ACTIVE_CHILD_PID=""
@@ -2353,17 +2471,7 @@ docker_dump_database_to_sql() {
 
     case "$BACKUP_DB_TYPE" in
         postgresql|postgres)
-            info "Starting pg_dump..."
-            password="$(backup_password_env_prefix)"
-            if [[ -n "$password" ]]; then
-                run_dump_command_to_file "$(backup_operation_label "PostgreSQL")" "$sql_file" \
-                    docker_target_exec env "PGPASSWORD=${password}" \
-                    pg_dump -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
-            else
-                run_dump_command_to_file "$(backup_operation_label "PostgreSQL")" "$sql_file" \
-                    docker_target_exec \
-                    pg_dump -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
-            fi
+            dump_docker_postgres_to_file "$sql_file"
             ;;
         mysql|mariadb)
             info "Starting mysqldump..."
@@ -2397,10 +2505,10 @@ native_dump_database_to_sql() {
             password="$(backup_password_env_prefix)"
             if [[ -n "$password" ]]; then
                 run_dump_command_to_file "$(backup_operation_label "PostgreSQL")" "$sql_file" \
-                    env "PGPASSWORD=${password}" pg_dump -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
+                    env "PGPASSWORD=${password}" PGPASSFILE=/dev/null pg_dump -w -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             else
                 run_dump_command_to_file "$(backup_operation_label "PostgreSQL")" "$sql_file" \
-                    pg_dump -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
+                    env PGPASSFILE=/dev/null pg_dump -w -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" "$BACKUP_DB_NAME"
             fi
             ;;
         mysql|mariadb)
@@ -2673,7 +2781,9 @@ run_database_backup() {
     fi
     info "Database: ${BACKUP_DB_NAME}"
 
+    trap 'backup_interrupted; exit 130' INT
     if ! create_database_dump "$output_file"; then
+        trap - INT
         BACKUP_OPERATION_CONTEXT="backup"
         BACKUP_LAST_RESULT="Failed"
         BACKUP_LAST_ERROR="BACKUP FAILED"
@@ -2682,6 +2792,7 @@ run_database_backup() {
         backup_failure_summary "${BACKUP_LAST_ERROR:-BACKUP FAILED}"
         return 1
     fi
+    trap - INT
     BACKUP_OPERATION_CONTEXT="backup"
 
     BACKUP_LAST_LOCAL_FILE="$output_file"
@@ -3432,8 +3543,38 @@ restore_interrupted() {
 
     warning "Restore interrupted."
     if [[ -n "${BACKUP_ACTIVE_CHILD_PID:-}" ]]; then
+        pkill -TERM -P "$BACKUP_ACTIVE_CHILD_PID" 2>/dev/null || true
         kill -TERM "$BACKUP_ACTIVE_CHILD_PID" 2>/dev/null || true
         sleep 1
+        pkill -KILL -P "$BACKUP_ACTIVE_CHILD_PID" 2>/dev/null || true
+        kill -KILL "$BACKUP_ACTIVE_CHILD_PID" 2>/dev/null || true
+        BACKUP_ACTIVE_CHILD_PID=""
+    fi
+    if [[ -n "${BACKUP_ACTIVE_TEMP_FILES:-}" ]]; then
+        while IFS= read -r temp_file; do
+            [[ -n "$temp_file" ]] && rm -f "$temp_file" 2>/dev/null || true
+        done <<< "$BACKUP_ACTIVE_TEMP_FILES"
+        BACKUP_ACTIVE_TEMP_FILES=""
+    fi
+    if [[ -n "${BACKUP_RESTORE_SAFETY_FILE:-}" ]]; then
+        info "Safety backup preserved at: ${BACKUP_RESTORE_SAFETY_FILE}"
+    fi
+    return 130
+}
+
+backup_interrupted() {
+    local temp_file
+
+    if [[ "${BACKUP_OPERATION_CONTEXT:-backup}" == "safety" ]]; then
+        warning "Restore interrupted."
+    else
+        warning "Backup interrupted."
+    fi
+    if [[ -n "${BACKUP_ACTIVE_CHILD_PID:-}" ]]; then
+        pkill -TERM -P "$BACKUP_ACTIVE_CHILD_PID" 2>/dev/null || true
+        kill -TERM "$BACKUP_ACTIVE_CHILD_PID" 2>/dev/null || true
+        sleep 1
+        pkill -KILL -P "$BACKUP_ACTIVE_CHILD_PID" 2>/dev/null || true
         kill -KILL "$BACKUP_ACTIVE_CHILD_PID" 2>/dev/null || true
         BACKUP_ACTIVE_CHILD_PID=""
     fi
@@ -3487,21 +3628,28 @@ sql_stream_restore() {
 
 docker_postgres_exec() {
     local password
+    local mode
+    local args=()
+    local arg
+
     password="$(backup_password_env_prefix)"
-    if [[ -n "$password" ]]; then
-        timeout_command "$BACKUP_COMMAND_TIMEOUT" docker_target_exec env "PGPASSWORD=${password}" psql -v ON_ERROR_STOP=1 -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
-    else
-        timeout_command "$BACKUP_COMMAND_TIMEOUT" docker_target_exec psql -v ON_ERROR_STOP=1 -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
-    fi
+    mode="$(docker_postgres_connection_mode)" || return 1
+    while IFS= read -r -d '' arg; do
+        args+=("$arg")
+    done < <(docker_postgres_base_connection_args "$mode")
+
+    timeout_command "$BACKUP_COMMAND_TIMEOUT" \
+        docker_postgres_exec_noninteractive "$password" \
+        psql -v ON_ERROR_STOP=1 "${args[@]}" -d "$BACKUP_DB_NAME" "$@"
 }
 
 native_postgres_exec() {
     local password
     password="$(backup_password_env_prefix)"
     if [[ -n "$password" ]]; then
-        timeout_command "$BACKUP_COMMAND_TIMEOUT" env "PGPASSWORD=${password}" psql -v ON_ERROR_STOP=1 -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
+        timeout_command "$BACKUP_COMMAND_TIMEOUT" env "PGPASSWORD=${password}" PGPASSFILE=/dev/null psql -w -v ON_ERROR_STOP=1 -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
     else
-        timeout_command "$BACKUP_COMMAND_TIMEOUT" psql -v ON_ERROR_STOP=1 -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
+        timeout_command "$BACKUP_COMMAND_TIMEOUT" env PGPASSFILE=/dev/null psql -w -v ON_ERROR_STOP=1 -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME" "$@"
     fi
 }
 
@@ -3682,11 +3830,16 @@ restore_database_from_file() {
     if [[ "$BACKUP_SOURCE_MODE" == "docker" ]]; then
         case "$BACKUP_DB_TYPE" in
             postgresql|postgres)
-                if [[ -n "$password" ]]; then
-                    sql_stream_restore "$file" docker_target_exec_input env "PGPASSWORD=${password}" psql -v ON_ERROR_STOP=1 -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
-                else
-                    sql_stream_restore "$file" docker_target_exec_input psql -v ON_ERROR_STOP=1 -h "${BACKUP_DB_HOST:-127.0.0.1}" -p "${BACKUP_DB_PORT:-5432}" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
-                fi
+                local pg_mode
+                local pg_args=()
+                local pg_arg
+                pg_mode="$(docker_postgres_connection_mode)" || return 1
+                while IFS= read -r -d '' pg_arg; do
+                    pg_args+=("$pg_arg")
+                done < <(docker_postgres_base_connection_args "$pg_mode")
+                sql_stream_restore "$file" \
+                    docker_postgres_exec_input_noninteractive "$password" \
+                    psql -v ON_ERROR_STOP=1 "${pg_args[@]}" -d "$BACKUP_DB_NAME"
                 ;;
             mysql|mariadb)
                 if [[ -n "$password" ]]; then
@@ -3719,9 +3872,9 @@ restore_database_from_file() {
         case "$BACKUP_DB_TYPE" in
             postgresql|postgres)
                 if [[ -n "$password" ]]; then
-                    sql_stream_restore "$file" env "PGPASSWORD=${password}" psql -v ON_ERROR_STOP=1 -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
+                    sql_stream_restore "$file" env "PGPASSWORD=${password}" PGPASSFILE=/dev/null psql -w -v ON_ERROR_STOP=1 -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
                 else
-                    sql_stream_restore "$file" psql -v ON_ERROR_STOP=1 -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
+                    sql_stream_restore "$file" env PGPASSFILE=/dev/null psql -w -v ON_ERROR_STOP=1 -h "$BACKUP_DB_HOST" -p "$BACKUP_DB_PORT" -U "$BACKUP_DB_USER" -d "$BACKUP_DB_NAME"
                 fi
                 ;;
             mysql|mariadb)
@@ -3768,6 +3921,7 @@ run_restore_transaction() {
         error "Safety backup failed. Restore cancelled."
         return 1
     fi
+    trap 'BACKUP_DESTINATION="$original_destination"; restore_interrupted; exit 130' INT
     BACKUP_RESTORE_SAFETY_FILE="$BACKUP_LAST_LOCAL_FILE"
     BACKUP_DESTINATION="$original_destination"
     info "Safety backup preserved at: ${BACKUP_RESTORE_SAFETY_FILE}"
